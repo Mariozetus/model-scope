@@ -3,36 +3,33 @@
  *
  * Compara el coste mensual fijo de una suscripción frente al coste estimado
  * usando API / agregador para el volumen EXACTO que el usuario declara.
+ *
+ * ADR 018: la SESIÓN es la unidad de trabajo. Cuota y ventana son
+ * restricciones ORTOGONALES y el resultado dice cuál de las dos frena al
+ * usuario.
  */
 
 import {
   DEFAULT_WORKING_DAYS_PER_MONTH,
-  INTENSITY_PROFILES,
-  type IntensityKey,
-  type UseCaseKey,
+  DEFAULT_SESSION_TURNS,
+  getWorkProfile,
+  quotaLevelHasNumber,
+  type WorkProfileKey,
 } from "@/lib/domain/constants";
-import type { ApiPricing } from "@/lib/domain/types";
+import type { ApiPricing, QuotaLevel, WorkMode } from "@/lib/domain/types";
 import { monthlyApiCost } from "@/lib/pricing/cost";
 import { round2 } from "@/lib/scoring/normalize";
+import { assessFit, sessionsPerConversation, tokensPerSession } from "@/lib/domain/equivalents";
 
-/** Multiplicadores de tokens según el caso de uso principal. */
-export const USE_CASE_MULTIPLIERS: Record<
-  UseCaseKey,
-  { input: number; output: number; label: string }
-> = {
-  // Más contexto (repos, docs) + más salida (código).
-  general: { input: 1.0, output: 1.0, label: "General" },
-  coding: { input: 1.3, output: 1.8, label: "Programación" },
-  // Mucho input (CSV, tablas), salida corta.
-  "data-analysis": { input: 2.0, output: 0.6, label: "Análisis de datos" },
-};
-
-/** Perfil de consumo según los sliders de la calculadora. */
 export interface CalculatorInput {
   /** Mensajes o consultas al día (5..100). */
   messagesPerDay: number;
-  intensity: IntensityKey;
-  useCase: UseCaseKey;
+  /** Perfil de trabajo: qué hace el usuario y con cuánto material. */
+  profile: WorkProfileKey;
+  /** Cómo consume el material (pega, repo conectado, todo de golpe). */
+  mode?: WorkMode;
+  /** Nº de intercambios por sesión de trabajo. */
+  sessionTurns?: number;
   /** Días laborables al mes (por defecto 22). */
   workingDaysPerMonth?: number;
 }
@@ -41,9 +38,11 @@ export interface CalculatorInput {
 export interface SubscriptionPlanInput {
   monthlyPrice: number;
   annualPrice?: number | null;
-  /** Nº de mensajes por ventana de reset. null = ilimitado. */
+  /** Nivel de cuota del plan (ADR 020). */
+  quotaLevel?: QuotaLevel;
+  /** Nº de mensajes por ventana de reset. null = el proveedor no lo publica. */
   estimatedMessageCap?: number | null;
-  /** Horas de la ventana de reset. null = ilimitado. */
+  /** Horas de la ventana de reset. null = no aplica. */
   resetWindowHours?: number | null;
   fallbackModelOnLimit?: string | null;
   includedTools?: string[];
@@ -51,7 +50,17 @@ export interface SubscriptionPlanInput {
   freeTierQuotaNote?: string | null;
 }
 
+/** Contexto del modelo para el cruce cuota vs ventana. */
+export interface ModelContext {
+  contextWindow?: number | null;
+  maxOutputTokens?: number | null;
+  name?: string;
+}
+
 export type Winner = "subscription" | "usage" | "tie";
+
+/** Qué restricción va a frenar al usuario. */
+export type BindingConstraint = "quota" | "context" | "none";
 
 export interface CalculatorResult {
   input: Required<CalculatorInput>;
@@ -63,9 +72,14 @@ export interface CalculatorResult {
   subscription: {
     monthlyCost: number;
     annualMonthlyCost: number | null;
-    /** Capacidad mensual traducida desde la cuota por ventana. null = ilimitado. */
+    /** Capacidad mensual traducida desde la cuota por ventana. null = no calculable. */
     messagesPerMonthCapacity: number | null;
+    /** true si la cuota es calculable (nivel numérico publicado). */
     quotaLimited: boolean;
+    /** true si el plan tiene un tope real, sea conocido o no. */
+    hasRealLimit: boolean;
+    /** Nivel de cuota del plan. */
+    quotaLevel: QuotaLevel;
     /** Coste por mensaje si la cuota es el factor limitante. */
     effectiveCostPerMessage: number | null;
     /** Mensajes que se degradarían a modelo fallback. */
@@ -77,6 +91,21 @@ export interface CalculatorResult {
     monthlyCost: number;
     costPerMessage: number;
     tokensPerMonth: number;
+  };
+
+  /** Sesiones que caben en la ventana del modelo (restricción de contexto). */
+  context: {
+    sessionsPerConversation: number | null;
+    tokensPerSession: number;
+    fitLevel: "FITS" | "TIGHT" | "SPLIT_REQUIRED" | "DOES_NOT_FIT";
+    fitLabel: string;
+    fitDetail: string;
+  };
+
+  /** Qué restricción va a frenar al usuario (ADR 018). */
+  binding: {
+    constraint: BindingConstraint;
+    labelEs: string;
   };
 
   recommendation: {
@@ -93,14 +122,16 @@ export function calculateSubscriptionVsUsage(
   input: CalculatorInput,
   plan: SubscriptionPlanInput,
   apiPricing: ApiPricing,
+  modelContext: ModelContext = {},
 ): CalculatorResult {
   const workingDaysPerMonth =
     input.workingDaysPerMonth ?? DEFAULT_WORKING_DAYS_PER_MONTH;
-  const profile = INTENSITY_PROFILES[input.intensity];
-  const mult = USE_CASE_MULTIPLIERS[input.useCase];
+  const profile = getWorkProfile(input.profile);
+  const mode = input.mode ?? "PASTE";
+  const sessionTurns = input.sessionTurns ?? DEFAULT_SESSION_TURNS;
 
-  const inputTokens = Math.round(profile.inputTokens * mult.input);
-  const outputTokens = Math.round(profile.outputTokens * mult.output);
+  const inputTokens = profile.inputTokens;
+  const outputTokens = profile.outputTokens;
   const interactionsPerMonth = Math.round(
     input.messagesPerDay * workingDaysPerMonth,
   );
@@ -110,10 +141,13 @@ export function calculateSubscriptionVsUsage(
   const annualMonthlyCost =
     plan.annualPrice != null ? plan.annualPrice / 12 : null;
 
+  const quotaLevel: QuotaLevel = plan.quotaLevel ?? "UNKNOWN";
+
   let messagesPerMonthCapacity: number | null = null;
   if (
     plan.estimatedMessageCap != null &&
-    plan.resetWindowHours != null
+    plan.resetWindowHours != null &&
+    quotaLevelHasNumber(quotaLevel)
   ) {
     const resetsPerMonth = (workingDaysPerMonth * 24) / plan.resetWindowHours;
     messagesPerMonthCapacity = Math.round(
@@ -122,6 +156,10 @@ export function calculateSubscriptionVsUsage(
   }
 
   const quotaLimited = messagesPerMonthCapacity != null;
+  // Un plan con fallback tiene tope aunque el número no se publique.
+  const hasRealLimit =
+    quotaLevel !== "UNLIMITED" &&
+    (quotaLimited || Boolean(plan.fallbackModelOnLimit));
   const overflowMessages = quotaLimited
     ? Math.max(0, interactionsPerMonth - messagesPerMonthCapacity!)
     : 0;
@@ -141,6 +179,20 @@ export function calculateSubscriptionVsUsage(
   const costPerMessage =
     interactionsPerMonth > 0 ? usageCost / interactionsPerMonth : 0;
   const tokensPerMonth = interactionsPerMonth * (inputTokens + outputTokens);
+
+  // ── RESTRICCIÓN DE CONTEXTO ──────────────────────────────────
+  const perSession = tokensPerSession(profile, sessionTurns);
+  const sessionsInWindow = sessionsPerConversation(
+    modelContext.contextWindow,
+    profile,
+    sessionTurns,
+  );
+  const fit = assessFit(
+    modelContext.contextWindow,
+    profile,
+    sessionTurns,
+    mode,
+  );
 
   // ── COMPARACIÓN ─────────────────────────────────────────────
   // La suscripción solo "gana" si cubre el uso real sin degradar.
@@ -171,7 +223,7 @@ export function calculateSubscriptionVsUsage(
         `sin degradar a ${fallback} y te ahorra $${savingsPerMonth.toFixed(2)} frente al pago por uso.`;
     } else {
       reason =
-        `La suscripción es ilimitada y te ahorra $${savingsPerMonth.toFixed(2)} frente al pago por uso.`;
+        `La suscripción es más barata (ahorra $${savingsPerMonth.toFixed(2)}/mes frente al pago por uso).`;
     }
   } else if (monthlyCost > usageCost) {
     winner = "usage";
@@ -195,6 +247,17 @@ export function calculateSubscriptionVsUsage(
       `La suscripción te da además ${plan.includedTools?.length ?? 0} herramientas incluidas.`;
   }
 
+  // ── ¿QUÉ RESTRICCIÓN FRENA AL USUARIO? ──────────────────────
+  const binding = resolveBindingConstraint({
+    quotaLimited,
+    overflowMessages,
+    interactionsPerMonth,
+    fitLevel: fit.level,
+    sessionsInWindow,
+    monthlyCost,
+    usageCost,
+  });
+
   const messagesPerDollar = {
     subscription:
       monthlyCost > 0
@@ -208,8 +271,9 @@ export function calculateSubscriptionVsUsage(
   return {
     input: {
       messagesPerDay: input.messagesPerDay,
-      intensity: input.intensity,
-      useCase: input.useCase,
+      profile: input.profile,
+      mode,
+      sessionTurns,
       workingDaysPerMonth,
     },
     interactionsPerMonth,
@@ -220,6 +284,8 @@ export function calculateSubscriptionVsUsage(
       annualMonthlyCost,
       messagesPerMonthCapacity,
       quotaLimited,
+      hasRealLimit,
+      quotaLevel,
       effectiveCostPerMessage,
       overflowMessages,
       includedTools: plan.includedTools ?? [],
@@ -229,7 +295,64 @@ export function calculateSubscriptionVsUsage(
       costPerMessage: round2(costPerMessage),
       tokensPerMonth,
     },
+    context: {
+      sessionsPerConversation: sessionsInWindow,
+      tokensPerSession: perSession,
+      fitLevel: fit.level,
+      fitLabel: fit.labelEs,
+      fitDetail: fit.detailEs,
+    },
+    binding,
     recommendation: { winner, savingsPerMonth, reason },
     messagesPerDollar,
+  };
+}
+
+/**
+ * Decide qué restricción va a frenar al usuario.
+ *
+ * Es la respuesta directa a «¿se me va a quedar corto?» y no existía antes
+ * de ADR 018, porque cuota y ventana se trataban como la misma cosa.
+ */
+function resolveBindingConstraint(args: {
+  quotaLimited: boolean;
+  overflowMessages: number;
+  interactionsPerMonth: number;
+  fitLevel: "FITS" | "TIGHT" | "SPLIT_REQUIRED" | "DOES_NOT_FIT";
+  sessionsInWindow: number | null;
+  monthlyCost: number;
+  usageCost: number;
+}): CalculatorResult["binding"] {
+  // Bloqueo duro: el material no cabe ni por partes.
+  if (args.fitLevel === "DOES_NOT_FIT") {
+    return {
+      constraint: "context",
+      labelEs:
+        "Te va a frenar la ventana de contexto: el material no cabe ni repartido en varias conversaciones.",
+    };
+  }
+
+  // La cuota se agota con el uso declarado → eso es lo que va a frenar.
+  if (args.quotaLimited && args.overflowMessages > 0) {
+    return {
+      constraint: "quota",
+      labelEs:
+        "Te va a frenar la cuota de mensajes, no la ventana: vas a superar el tope del plan y los mensajes sobrantes degradan de modelo.",
+    };
+  }
+
+  // La ventana obliga a repartir el trabajo → más sesiones → más cuota.
+  if (args.fitLevel === "SPLIT_REQUIRED") {
+    return {
+      constraint: "context",
+      labelEs:
+        "Te va a frenar la ventana de contexto: el material no cabe de una sentada, así que necesitarás más sesiones (y por tanto más cuota).",
+    };
+  }
+
+  return {
+    constraint: "none",
+    labelEs:
+      "Ninguna de las dos restricciones te va a frenar con este volumen de uso.",
   };
 }

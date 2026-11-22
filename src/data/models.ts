@@ -9,19 +9,26 @@ import { BENCHMARKS } from "@/lib/domain/benchmarks";
 import type {
   AccessChannel,
   ApiPricing,
+  Laboratory,
   LocalRequirements,
   Model,
   ModelBenchmarkResult,
+  Provider,
   SkillProfile,
 } from "@/lib/domain/types";
-import { LABORATORIES as _L, MODELS } from "@/data/seed";
+import { LABORATORIES as _L, MODELS, PROVIDERS as _P } from "@/data/seed";
 import { scoreByCohort } from "@/lib/scoring/cohort";
 import { aggregateSkillProfile, overallScore } from "@/lib/scoring/skills";
 import { classifySpeed, type SpeedClassification } from "@/lib/scoring/speed";
-import { translateContextWindow } from "@/lib/domain/equivalents";
+import {
+  buildContextBudget,
+  describeMaterialCapacity,
+  translateContextWindow,
+} from "@/lib/domain/equivalents";
 
 export { MODELS } from "@/data/seed";
 export const LABORATORIES = _L;
+export const PROVIDERS = _P;
 
 // ─────────────────────────────────────────────────────────────
 // TIPOS DE VISTA
@@ -43,6 +50,10 @@ export interface EnrichedModel extends Model {
   speed: SpeedClassification;
   /** Equivalentes legibles de la ventana de contexto. */
   capacity: ReturnType<typeof translateContextWindow>;
+  /** Presupuesto de la conversación (entrada + salida comparten tope). */
+  budget: ReturnType<typeof buildContextBudget>;
+  /** Qué cabe de material en la ventana, en lenguaje llano. */
+  materialCapacity: ReturnType<typeof describeMaterialCapacity>;
   /** Canales de acceso particionados por tipo. */
   subscriptions: AccessChannel[];
   apiChannels: AccessChannel[];
@@ -165,6 +176,8 @@ export function getEnrichedModels(): EnrichedModel[] {
       cohortSizes: cohortSizes.get(model.id) ?? {},
       speed: classifySpeed(speedSource.tps, speedSource.ttft),
       capacity: translateContextWindow(model.contextWindow),
+      budget: buildContextBudget(model.contextWindow, model.maxOutputTokens),
+      materialCapacity: describeMaterialCapacity(model.contextWindow),
       subscriptions,
       apiChannels,
       localChannels,
@@ -231,8 +244,22 @@ export function getModelById(id: string): EnrichedModel | undefined {
   return getEnrichedModels().find((m) => m.id === id);
 }
 
-/** Precios de API "baratos" por modelo (el más barato disponible). */
+/**
+ * Precios de API "baratos" por modelo (el más barato disponible).
+ *
+ * Devuelve el canal CON SU IDENTIDAD: sin el nombre del proveedor, la
+ * comparativa de la ficha ": API oficial" vs "OpenRouter" no tenía sentido
+ * (era un empate disfrazado de victoria de precio).
+ */
 export function getCheapestApiPricing(model: EnrichedModel): ApiPricing | null {
+  return getApiPricings(model)[0] ?? null;
+}
+
+/**
+ * Todas las vías de pago por uso de un modelo, ordenadas de más barata a más
+ * cara. Conserva el proveedor para que la UI pueda nombrarlo.
+ */
+export function getApiPricings(model: EnrichedModel): ApiPricing[] {
   const candidates: ApiPricing[] = [];
 
   for (const channel of model.apiChannels) {
@@ -255,13 +282,22 @@ export function getCheapestApiPricing(model: EnrichedModel): ApiPricing | null {
     }
   }
 
-  if (candidates.length === 0) return null;
+  // Orden estable: a igualdad de blended, gana la vía first-party (es la
+  // oficial del laboratorio). Antes el `reduce` ganaba por orden de aparición,
+  // lo que hacía que un empate pareciera una victoria de precio.
+  return candidates
+    .map((pricing, index) => ({ pricing, index }))
+    .sort((a, b) => {
+      const diff = blendedOf(a.pricing) - blendedOf(b.pricing);
+      if (Math.abs(diff) > 1e-9) return diff;
+      return a.index - b.index;
+    })
+    .map((c) => c.pricing);
+}
 
-  return candidates.reduce((best, current) => {
-    const bestBlended = (3 * best.inputPer1M + best.outputPer1M) / 4;
-    const curBlended = (3 * current.inputPer1M + current.outputPer1M) / 4;
-    return curBlended < bestBlended ? current : best;
-  });
+/** Coste blended 3:1 (input:output) — la unidad comparable entre vías. */
+export function blendedOf(pricing: ApiPricing): number {
+  return (3 * pricing.inputPer1M + pricing.outputPer1M) / 4;
 }
 
 /** Suscripción oficial más barata de un modelo (si existe). */
@@ -294,6 +330,70 @@ export function getBenchmarkCatalog() {
 /** Modelos que se pueden autoalojar (pesos abiertos). */
 export function getSelfHostableModels(): EnrichedModel[] {
   return getEnrichedModels().filter((m) => m.canSelfHost);
+}
+
+// ─────────────────────────────────────────────────────────────
+// MÓDULO E — ÍNDICE DE LABORATORIOS Y PROVEEDORES (ADR 022)
+// ─────────────────────────────────────────────────────────────
+
+/** Un laboratorio con los modelos que publica. */
+export interface LaboratoryWithModels {
+  laboratory: Laboratory;
+  models: EnrichedModel[];
+}
+
+/** Un proveedor con los modelos que sirve. */
+export interface ProviderWithModels {
+  provider: Provider;
+  models: EnrichedModel[];
+}
+
+/**
+ * Laboratorios con sus modelos, ordenados por número de modelos y luego por
+ * nombre. Es un ÍNDICE: no expone precios propios, solo navegación.
+ */
+export function getLaboratoriesWithModels(): LaboratoryWithModels[] {
+  const models = getEnrichedModels();
+  return LABORATORIES.map((laboratory) => ({
+    laboratory,
+    models: models.filter((m) => m.laboratoryId === laboratory.id),
+  }))
+    .filter((entry) => entry.models.length > 0)
+    .sort(
+      (a, b) =>
+        b.models.length - a.models.length ||
+        a.laboratory.name.localeCompare(b.laboratory.name, "es"),
+    );
+}
+
+/**
+ * Proveedores con los modelos que sirven, ordenados igual que los
+ * laboratorios.
+ */
+export function getProvidersWithModels(): ProviderWithModels[] {
+  const models = getEnrichedModels();
+  return PROVIDERS.map((provider) => ({
+    provider,
+    models: models.filter((m) =>
+      m.providerOffers.some((o) => o.providerId === provider.id),
+    ),
+  }))
+    .filter((entry) => entry.models.length > 0)
+    .sort(
+      (a, b) =>
+        b.models.length - a.models.length ||
+        a.provider.name.localeCompare(b.provider.name, "es"),
+    );
+}
+
+/** Laboratorio por slug (o `undefined`). */
+export function getLaboratoryBySlug(slug: string): Laboratory | undefined {
+  return LABORATORIES.find((l) => l.slug === slug);
+}
+
+/** Proveedor por slug (o `undefined`). */
+export function getProviderBySlug(slug: string): Provider | undefined {
+  return PROVIDERS.find((p) => p.slug === slug);
 }
 
 /**
