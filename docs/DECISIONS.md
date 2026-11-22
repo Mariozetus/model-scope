@@ -33,6 +33,13 @@ revoque; no edites la anterior en silencio. El histórico es el valor.
 | [014](#014) | Los precios se verifican contra la página oficial | Aceptada |
 | [015](#015) | `EnrichedModel` es el contrato estable de la capa de datos | Aceptada |
 | [016](#016) | El top 20 se amplía con `isFeatured`, no con un número fijo | Aceptada |
+| [017](#017) | Los tokens son unidad interna y de precio, nunca una capacidad legible | Aceptada |
+| [018](#018) | La sesión es la unidad de trabajo; cuota y ventana son ortogonales | Aceptada |
+| [019](#019) | La ventana de contexto es un presupuesto único, entrada + salida | Aceptada |
+| [020](#020) | La cuota tiene nivel explícito, no un binario ilimitado/limitado | Aceptada |
+| [021](#021) | Perfiles de trabajo con referencia visible, sin multiplicadores opuestos | Aceptada |
+| [022](#022) | Módulo E (laboratorios y proveedores) es un índice, sin datos nuevos | Aceptada |
+| [023](#023) | La app es un comparador: el recomendador es la puerta de entrada | Aceptada |
 
 ---
 
@@ -706,3 +713,389 @@ Consecuencia futura: cuando el catálogo supere los 20, el top se ajusta
   el top sería «los 20 con mejor overall», que es un criterio distinto del
   editorial y no tiene en cuenta la novedad o la representatividad del
   catálogo.
+
+---
+
+## 017 · Los tokens son unidad interna y de precio, nunca una capacidad legible
+
+**Estado:** Aceptada · **Ámbito:** `src/lib/domain/equivalents.ts`, `src/lib/domain/constants.ts`
+
+### Contexto
+
+El catálogo mezclaba tres cosas distintas bajo la misma palabra «tokens»:
+
+1. **Unidad interna de cálculo** — el motor de costes y la fórmula de la
+   calculadora. Nunca debe verse.
+2. **Unidad de precio** — cómo se factura todo el mundo ($8 por millón de
+   tokens). Imprescindible, pero hay que explicar la unidad.
+3. **Capacidad del modelo** — cuántos tokens caben en la ventana de contexto.
+
+El error fue que (3) se traducía a «páginas» y «novelas cortas» mientras (2)
+se dejaba en tokens crudos. El usuario veía «Capacidad: ~2.100 páginas» junto
+a «$8 / $40 por 1M tokens» sin saber qué era cada cosa ni cómo se relacionaban.
+
+El problema de fondo: **«páginas» es un equivalente de lectura**, y el producto
+cubre también programación (§2: «solo LLMs de texto y código»). Un programador
+necesita saber si «2.100 páginas» es su repositorio, y no lo es.
+
+### Decisión
+
+Regla de tres niveles según el contexto:
+
+| Contexto | Unidad | Ejemplo |
+|---|---|---|
+| **Precio** | Tokens, con la unidad explícita | «$8 por cada millón de tokens que le envías · $40 por cada millón que te devuelve» |
+| **Capacidad del modelo** | Equivalente del mundo del usuario | «caben ~200.000 líneas de código» |
+| **Cuota del plan** | Sesiones de trabajo | «800 mensajes / 5 h ≈ 230 sesiones de revisión de código al día» |
+
+Los tokens **nunca** son la unidad de una capacidad. Cuando aparecen, es
+porque son la **unidad de medida de un precio**, y siempre acompañados de la
+explicación de qué es lo que se está pagando.
+
+La equivalencia de capacidad deja de ser una única traducción universal y pasa
+a ser **contextual**: el catálogo declara qué equivalentes tienen sentido para
+ese modelo según sus `useCases` (código, documentos, datos).
+
+### Consecuencias
+
+- El Modo Práctico puede hablar de «líneas de código» sin jerga de tokens.
+- La ficha del modelo no mezcla «páginas» con «128.000 tokens» sin contexto.
+- Los tokens desaparecen de la calculadora como dato de entrada del usuario:
+  el usuario declara **trabajo**, no tokens.
+- Las equivalencias de capacidad necesitan **unidades de código** que antes no
+  existían (`HUMAN_EQUIVALENTS`).
+
+### Alternativas descartadas
+
+- **Mostrar siempre tokens crudos.** Descartada: es jerga y no permite
+  dimensionar nada (§3.6).
+- **«Páginas» como equivalente universal.** Descartada: solo sirve para
+  lectura; no responde a «¿cabe mi repo?».
+- **Horas de trabajo como unidad de cuota.** Descartada: el consumo no es
+  lineal con el tiempo — en minutos se te puede agotar la cuota, y con otro
+  tipo de trabajo en horas no. La unidad agotada es un **contador de
+  interacciones**, no una medida de tiempo.
+
+---
+
+## 018 · La sesión es la unidad de trabajo; cuota y ventana son ortogonales
+
+**Estado:** Aceptada · **Ámbito:** `src/lib/domain/types.ts`, `src/lib/calculator/`
+
+### Contexto
+
+Las preguntas que el usuario trae son de **uso diario**, no de tokens:
+
+- «¿Cuánto voy a poder usar esta suscripción día a día?»
+- «¿Voy a llegar a los límites diarios y semanales?»
+- «¿Se me va a quedar corto?»
+
+Para responderlas hay que cruzar dos restricciones que el producto mezclaba:
+
+| Restricción | La impone | Naturaleza |
+|---|---|---|
+| **Interacciones** | el plan (cuota) | contador **artificial** del producto |
+| **Tokens acumulados** | el modelo (ventana) | límite **físico** del modelo |
+
+Un casoFrequently confuso: un usuario con ventana de 32k que trabaja con un
+proyecto de 300k tokens **no está en problemas** si reparte el trabajo en
+varias conversaciones. Que el material no quepa en *una* conversación no
+significa que no pueda terminar el trabajo, y **no agota la cuota**: solo
+significa que necesita más sesiones.
+
+La app no podía responderlo porque `contextWindow` y `maxOutputTokens` eran
+campos muertos e independientes, y porque no existía el concepto de tamaño de
+sesión.
+
+### Decisión
+
+Se introduce la **sesión** como unidad de trabajo:
+
+> **Sesión** = un bloque de intercambios sobre un tema, en una conversación,
+> con un tamaño de trabajo concreto.
+
+Una sesión consume cuota (interacciones) **y** ocupa ventana (tokens
+acumulados), y **puede agotarse en momentos distintos**:
+
+- La cuota se agota por hacer **demasiados intercambios**.
+- La ventana se agota por hacer una sesión **demasiado larga**.
+
+Esto genera un veredicto nuevo que antes no existía: **qué restricción va a
+frenar al usuario**. Es la respuesta directa a «¿se me va a quedar corto?».
+
+El tamaño de la sesión (nº de intercambios) es un **parámetro del usuario**, no
+del modelo: por eso vive en la calculadora, no en la ficha.
+
+### Consecuencias
+
+- La capacidad del modelo pasa a expresarse en «sesiones de tipo X», que es
+  accionable y no requiere saber qué es un token.
+- La comparación cuota-vs-ventana se puede hacer explícita en la UI.
+- El aviso de «no cabe» deja de ser un binario: distinguir «no cabe de una
+  sentada» (informativo) de «no cabe ni por partes» (bloqueante).
+
+### Alternativas descartadas
+
+- **Horas de trabajo.** Descartada: el consumo no es lineal con el tiempo.
+- **Tokens como unidad de cuota.** Descartada: obliga al usuario a pensar en
+  tokens, que es justo lo que se quiere evitar.
+- **Una sola restricción (cuota o ventana).** Descartada: son ortogonales y
+  la respuesta útil es «cuál de las dos te frena».
+
+---
+
+## 019 · La ventana de contexto es un presupuesto único, entrada + salida
+
+**Estado:** Aceptada · **Ámbito:** `src/lib/domain/types.ts`, `src/lib/domain/equivalents.ts`
+
+### Contexto
+
+El dominio tenía dos campos independientes:
+
+```ts
+contextWindow?: number;     // "Tokens totales (input + output)"
+maxOutputTokens?: number;
+```
+
+El comentario decía «tokens totales (input + output)», pero los números del
+seed (`contextWindow: 1_050_000`, `maxOutputTokens: 128_000`) se leían como si
+fueran acumulables. **No lo son**: la ventana es un presupuesto **único** que
+la entrada y la salida comparten. Enviar 900.000 tokens deja 150.000 para la
+respuesta, no 1.178.000.
+
+El modelo actual no podía expresar «¿cuánto me queda para la respuesta?», que
+es la pregunta que decide si un parche largo se va a cortar.
+
+### Decisión
+
+La ventana se modela como un **presupuesto con dos restricciones
+simultáneas**:
+
+- `contextWindow` — presupuesto total (entrada + salida).
+- `maxOutputTokens` — techo de lo que puede ocupar la respuesta dentro de ese
+  presupuesto.
+
+La ficha presenta:
+- **Titular**: el equivalente absoluto («cabe un proyecto entero»).
+- **Detalle**: el reparto («de 1.050.000 tokens: ~922.000 puedes enviar y
+  hasta 128.000 puedes recibir»).
+
+### Consecuencias
+
+- Se puede avisar de que una respuesta se va a cortar por falta de presupuesto
+  de salida, no solo por falta de ventana.
+- El cálculo de «sesiones que caben» usa el presupuesto real, no una suma
+  ingenua.
+
+### Alternativas descartadas
+
+- **Tratar `contextWindow` y `maxOutputTokens` como acumulables.** Descartada:
+  contradice el significado real de la ventana.
+- **Exigir `maxOutputTokens` siempre.** Descartada: no todos los proveedores lo
+  publican; se mantiene opcional.
+
+---
+
+## 020 · La cuota tiene nivel explícito, no un binario ilimitado/limitado
+
+**Estado:** Aceptada · **Ámbito:** `src/lib/domain/types.ts`, `src/lib/calculator/quota.ts`
+
+### Contexto
+
+`estimatedMessageCap: null` significaba «sin límite de mensajes», y la
+calculadora lo traducía a capacidad infinita. Pero:
+
+1. **No hay ningún plan de $100/mes que sea realmente ilimitado.** OpenAI,
+   Anthropic y Google comunican sus planes con niveles: «very high», «high»,
+   «medium», «limited».
+2. **La propia app se contradecía**: la ficha decía «Sin límite de mensajes» y
+   a la vez «Degrada a GPT-6.2 Sol». Si hay fallback, hay un límite.
+3. El cálculo daba «la suscripción gana siempre» para los planes caros — el
+   peor tipo de error, porque hace perder dinero al usuario.
+
+### Decisión
+
+La cuota se modela con un **nivel explícito** más un número opcional cuando el
+proveedor lo publica:
+
+```ts
+type QuotaLevel =
+  | "UNLIMITED"   // sin techo conocido
+  | "VERY_HIGH"   // cientos de mensajes por ventana
+  | "HIGH"        // decenas
+  | "MEDIUM"      // ~40-80 por ventana
+  | "LIMITED"     // menos de 40 por ventana
+  | "UNKNOWN";    // el proveedor no publica el nivel
+```
+
+Un canal **debe** declarar `quotaLevel`. El número (`estimatedMessageCap`)
+sigue existiendo, pero solo es la fuente de verdad cuando hay nivel numérico.
+Para los niveles no numéricos la capacidad **no es calculable** y la UI lo
+dice en lugar de inventar un infinito.
+
+### Consecuencias
+
+- La UI puede decir «Límite muy alto — el proveedor no publica el número
+  exacto» en vez de mentir con un infinito.
+- El overflow sigue calculándose igual cuando hay número.
+- El seed debe reclasificar los ~10 planes de suscripción.
+
+### Alternativas descartadas
+
+- **Dejar `null` = ilimitado.** Descartada: es una mentira sobre los planes
+  reales, y el producto existe precisamente para no mentir con precios.
+- **Eliminar el binario y guardar solo el número.** Descartada: obliga a
+  inventar un número cuando el proveedor no lo publica.
+
+---
+
+## 021 · Perfiles de trabajo con referencia visible, sin multiplicadores opuestos
+
+**Estado:** Aceptada · **Ámbito:** `src/lib/domain/constants.ts`, `src/lib/calculator/`
+
+### Contexto
+
+El modelo de consumo tenía **dos ejes que se multiplicaban y no eran
+ortogonales**:
+
+- `INTENSITY_PROFILES` (tamaño): short / medium / long.
+- `USE_CASE_MULTIPLIERS` (tipo): general / coding / data-analysis.
+
+El resultado era que **el mismo perfil mostraba cifras distintas según el
+dropdown de caso de uso**, y las combinaciones no tenían sentido:
+«chat corto + programación» costaba *más* tokens de entrada que «chat corto +
+general» (800 × 1.3), y «chat corto + análisis de datos» duplicaba la entrada
+mientras reducía la salida a la mitad. Nadie entendía esos números.
+
+Además, en Modo Práctico se mostraban tokens **crudos y sin unidad**
+(`800 / 400`), y el campo `pagesEquivalent` se calculaba y **nunca se
+renderizaba**.
+
+### Decisión
+
+Un **único eje** de perfiles de trabajo, con una **referencia visible** que
+explica qué es cada uno en términos de contenido real:
+
+| Perfil | Referencia | Tokens (in / out) |
+|---|---|---|
+| Pregunta rápida | «¿Cómo centro un div?» — una duda de 3 líneas | 400 / 300 |
+| Revisión de código | un PR de ~500 líneas | 4.000 / 1.500 |
+| Trabajo sobre repo o documento | el proyecto entero (decenas de miles de líneas) | 80.000 / 8.000 |
+
+El eje «caso de uso» desaparece como multiplicador: su contenido se **absorbe**
+en los perfiles («programación» vive en «revisión de código», «análisis de
+datos» en «documento»). Se conserva la información y se elimina la
+contradicción.
+
+En la UI el perfil se muestra con su **referencia**, no con tokens sueltos. Los
+tokens aparecen solo como **unidad de medida con significado**, no como número
+abstracto.
+
+### Consecuencias
+
+- Un solo control, sin combinaciones contradictorias.
+- La escalera de coste es visible: 700 tokens (pregunta) → 88.000 (proyecto
+  completo), ~125× de diferencia, con ejemplos que el usuario reconoce.
+- Los tests que verificaban que «coding > general» se reescriben: el eje
+  desapareció.
+
+### Alternativas descartadas
+
+- **3 × 3 (contenido × material).** Descartada: dos controles con 9 perfiles
+  es más fricción de la que el objetivo del producto justifica.
+- **Mantener el multiplicador con valores coherentes.** Descartada: el eje
+  «tipo de trabajo» y el eje «tamaño» no son ortogonales; mientras ambos
+  existan, habrá combinaciones que se contradigan.
+- **Mostrar tokens crudos sin unidad.** Descartada: es la causa directa de la
+  confusión reportada.
+
+---
+
+## 022 · Módulo E (laboratorios y proveedores) es un índice, sin datos nuevos
+
+**Estado:** Aceptada · **Ámbito:** `src/app/laboratorios/`, `src/app/proveedores/`
+
+### Contexto
+
+El usuario explore el catálogo y quiere saber **qué modelos da cada
+laboratorio** y **qué ofrece cada proveedor**. El seed ya tiene `LABORATORIES`
+y `PROVIDERS`, pero `PROVIDERS` estaba exportado y **nunca importado** en
+ningún sitio: datos muertos.
+
+El módulo se discutió explícitamente y se delimitó: es **un índice de
+navegación**, no un módulo de precios. No expone precios propios ni tablas de
+precios por proveedor.
+
+### Decisión
+
+Dos rutas de solo lectura:
+
+- `/laboratorios` — cada laboratorio con los modelos que publica y sus vías
+  de acceso (suscripción / API / local).
+- `/proveedores` — cada proveedor con los modelos que sirve.
+
+Ambas enlazan a las fichas existentes. **No se añaden datos nuevos**: se
+consume el seed que ya existe.
+
+Consecuencia de datos: las ofertas de terceros (`ProviderOffer`) no tienen
+`lastVerifiedDate`, lo que viola §3.7 («toda cifra nueva lleva `source` o
+`lastVerifiedDate`)). Se corrige como parte de este módulo.
+
+### Alternativas descartadas
+
+- **Índice con tabla de precios por proveedor.** Descartada: exigiría subir
+  `ProviderOffer` a entidad de primer nivel con precios y fechas propias, que
+  es un módulo de precios nuevo y no un índice.
+- **Fusionar laboratorios y proveedores en una sola página.** Descartada: son
+  cosas distintas — el laboratorio **entrena** y publica; el proveedor **sirve**
+  modelos que otros entrenaron.
+
+---
+
+## 023 · La app es un comparador: el recomendador es la puerta de entrada
+
+**Estado:** Aceptada · **Ámbito:** `src/app/page.tsx`, `src/lib/recommender/wizard.ts`
+
+### Contexto
+
+El objetivo declarado del producto es **«poder comparar suscripciones o
+APIs»**. La home actual es un catálogo con la calculadora y el recomendador
+**debajo**, y el módulo C (calculadora) compara *una* suscripción contra *la*
+API de *un* modelo — no compara suscripciones entre sí.
+
+El usuario que entra sin saber nada no tiene un modelo en mente: quiere «qué
+me conviene». Y las dos preguntas que decide comprar son
+**económicas y de tiempo**: «¿cuánto me va a costar?» y «¿me va a dar para
+trabajar?».
+
+### Decisión
+
+La home se reorienta a **comparador**:
+
+1. El **recomendador** (módulo D) sube a la posición de entrada: es el que
+   responde «qué es lo que más me conviene» sin que el usuario sepa nada.
+2. El **comparador** (módulo C ampliado) puede contrastar **varias vías a la
+   vez** — suscripciones de distintos laboratorios y APIs — no solo una
+   suscripción contra una API.
+3. La comparación se hace en una **unidad común** (tokens normalizados, ADR
+   017/018), porque dos suscripciones de laboratorios distintos no son
+   comparables en mensajes sin normalizar.
+
+El módulo C no desaparece: **gana alcance**. Pasa de «compara esta
+suscripción con esta API» a «compara estas opciones entre sí».
+
+### Consecuencias
+
+- El catálogo (módulo A) deja de ser el punto de entrada principal.
+- El recomendador necesita evaluar **planes de suscripción**, no solo canales
+  de modelo: una suscripción es del laboratorio, no del modelo.
+- La comparación entre suscripciones requiere la entidad «plan», que el
+  dominio no tiene todavía.
+
+### Alternativas descartadas
+
+- **Dejar el catálogo como entrada y ampliar la calculadora.** Descartada: el
+  usuario que no sabe qué modelo quiere no puede elegir nada en un catálogo.
+- **Crear un módulo nuevo «comparador».** Descartada: es una reorientación del
+  C y del D, no una funcionalidad aparte — añadir un módulo nuevo es exactamente
+  lo que §2 prohíbe sin discusión.

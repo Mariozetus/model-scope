@@ -54,6 +54,18 @@ El producto son cuatro módulos. Nada más entra sin discusión.
 implementa. El brief original es explícito sobre esto y la tentación de crecer es
 el riesgo principal del proyecto.
 
+**Módulo E — Índice de laboratorios y proveedores** (ADR 022): es un módulo de
+**navegación**, no de datos. Responde a dos preguntas — ¿qué modelos da cada
+laboratorio? ¿qué ofrece cada proveedor? — y **no expone precios propios**.
+Vive en `src/app/laboratorios/page.tsx`. Se acepta porque el catálogo ya tenía
+las entidades `Laboratory` y `Provider` (`PROVIDERS` estaba exportado y nunca
+importado: datos muertos).
+
+**La app es un COMPARADOR** (ADR 023): el recomendador es la puerta de entrada,
+porque es lo que responde «qué es lo que más me conviene» cuando el usuario
+todavía no sabe qué modelo quiere. El catálogo queda como exploración del
+detalle.
+
 ## 3. Principios de diseño
 
 ### 3.1 La escala 1–10 es un instrumento, no un hecho absoluto
@@ -150,6 +162,83 @@ Cada entrada del seed lleva `source` (en benchmarks) o `lastVerifiedDate` (en
 precios y suscripciones). Los datos de referencia se etiquetan como tales en la
 interfaz. No se presentan cifras sin procedencia.
 
+### 3.8 Los tokens nunca son una capacidad legible (ADR 017)
+
+El token aparece en el producto con **tres** significados distintos, y cada uno
+obliga a una regla:
+
+| Contexto | Unidad | Regla |
+|---|---|---|
+| Cálculo interno | tokens | Se esconden. Son la maquinaria. |
+| **Precio** | tokens | Se muestran, **siempre con la unidad explícita**: «$8 por cada millón de tokens que le envías · $40 por cada millón que te devuelve». |
+| **Capacidad** | equivalentes del mundo del usuario | **Nunca tokens.** «Cabe un proyecto entero», «~20.000 líneas de código», «230 sesiones al día». |
+
+El error que motivó la decisión: la capacidad se traducía a «páginas» (un
+equivalente de **lectura**) mientras el precio se dejaba en tokens crudos. El
+usuario veía «Capacidad: ~2.100 páginas» junto a «$8 / $40 por 1M tokens» sin
+saber qué era cada cosa. Y un programador no puede dimensionar su repositorio
+en páginas.
+
+**Consecuencia:** si un token aparece en la interfaz como capacidad, es un bug.
+
+### 3.9 La sesión es la unidad de trabajo; cuota y ventana son ortogonales (ADR 018)
+
+**Sesión** = un bloque de intercambios sobre un tema, en una conversación.
+
+Las dos restricciones que frenan al usuario son **ortogonales**:
+
+| Restricción | La impone | Se agota cuando |
+|---|---|---|
+| **Interacciones** | el plan (cuota) | haces demasiados mensajes |
+| **Tokens acumulados** | el modelo (ventana) | el tema se alarga demasiado |
+
+Por eso el producto tiene que responder **«¿qué te va a frenar?»** y no solo
+«¿cuál es más barato?». Y con un matiz que la app debe respetar: **que el
+material no quepa en *una* conversación no significa que no puedas terminar el
+trabajo**. Se reparte en más sesiones, que consume cuota pero no es un bloqueo.
+
+De aquí sale el veredicto `binding` (`quota` / `context` / `none`).
+
+### 3.10 La ventana de contexto es un presupuesto único (ADR 019)
+
+`contextWindow` y `maxOutputTokens` **no se suman**. La ventana es un
+presupuesto que la entrada y la salida comparten:
+
+```
+contextWindow  = 1.050.000   ← presupuesto total
+maxOutputTokens = 128.000    ← techo de la respuesta DENTRO del presupuesto
+→ puedes enviar ~922.000 y recibir hasta 128.000
+```
+
+La ficha lo presenta con el **titular** (qué cabe: «Cabe un proyecto entero») y
+el **detalle** (el reparto del presupuesto).
+
+### 3.11 La cuota tiene nivel explícito (ADR 020)
+
+No hay ningún plan de $100/mes que sea realmente ilimitado, y si hay fallback
+**hay un límite por definición**. El dominio usa `QuotaLevel`
+(`UNLIMITED` | `VERY_HIGH` | `HIGH` | `MEDIUM` | `LIMITED` | `UNKNOWN`), no un
+`null` que significa "ilimitado".
+
+Consecuencia operativa: cuando el nivel **no es numérico**, la capacidad
+mensual **no es calculable** y la UI lo dice. Devolver un infinito haría creer
+que el plan nunca se agota, y el error más caro es ese.
+
+### 3.12 Un solo eje de perfiles de trabajo (ADR 021)
+
+El consumo se declara con **un** perfil, no con dos multiplicadores que se
+contradicen:
+
+| Perfil | Referencia visible | Tokens (in / out) |
+|---|---|---|
+| Pregunta rápida | «¿Cómo centro un div?» — una duda de 3 líneas | 400 / 300 |
+| Revisión de código | un PR de ~500 líneas | 4.000 / 1.500 |
+| Repo o documento | el proyecto entero — decenas de miles de líneas | 80.000 / 8.000 |
+
+La **referencia** no es decoración: sin ella las cifras no significan nada para
+quien no sabe qué es un token. Y el eje «caso de uso» desapareció como
+multiplicador porque no era ortogonal con el de tamaño.
+
 ## 4. Modelo de dominio (resumen)
 
 Source of truth: `src/lib/domain/types.ts`.
@@ -175,17 +264,21 @@ Entidades clave:
 - **`AccessChannel`** — la unidad de comparación real. `kind` ∈
   `OFFICIAL_SUBSCRIPTION | FIRST_PARTY_API | THIRD_PARTY_API | LOCAL_SELF_HOSTED`.
   Contiene tanto precios por 1M como los campos de suscripción (precio mensual,
-  cuota por ventana, horas de reset, fallback, `trainsOnUserDataByDefault`).
+  `quotaLevel`, cuota por ventana, horas de reset, fallback,
+  `trainsOnUserDataByDefault`).
 - **`Provider`** — agregador / inferencia / cloud / first-party.
 - **`LocalRequirements`** — VRAM, descarga Q4, parámetros, runtimes, comando.
 - **`SkillProfile`** — seis dimensiones (code, reasoning, writing, languages,
   data-analysis, long-context) normalizadas 0..10.
+- **`QuotaLevel`** — `UNLIMITED | VERY_HIGH | HIGH | MEDIUM | LIMITED | UNKNOWN`.
+- **`WorkProfile`** — perfil de trabajo: `reference` + tokens in/out.
+- **`WorkMode`** — `PASTE | CONNECTED | ALL_AT_ONCE`: cómo consume el material.
 
 ### Vías de acceso
 
 | `kind` | Qué es | Qué tiene de especial |
 |---|---|---|
-| `OFFICIAL_SUBSCRIPTION` | Plan B2C de tarifa plana (ChatGPT Plus, Claude Pro…) | Cuota por ventana, fallback, entrenamiento con datos |
+| `OFFICIAL_SUBSCRIPTION` | Plan B2C de tarifa plana (ChatGPT Plus, Claude Pro…) | `quotaLevel`, cuota por ventana, fallback, entrenamiento con datos |
 | `FIRST_PARTY_API` | Pago por uso directo al laboratorio | Precio por 1M input/output/cache |
 | `THIRD_PARTY_API` | Agregador o proveedor de inferencia | Precio + throughput + TTFT |
 | `LOCAL_SELF_HOSTED` | En tu propia infraestructura | Coste marginal 0, hardware real |
@@ -241,7 +334,44 @@ si no_cubre_y_API_más_barata       → winner = usage (doble victoria)
 si empate                          → winner = tie
 ```
 
-### 5.4 Recomendador
+**Guarda de ADR 020:** la capacidad mensual solo se calcula si el `quotaLevel`
+es numérico (`LIMITED`/`MEDIUM`/`HIGH`/`VERY_HIGH`). Si el nivel es
+`VERY_HIGH`, `UNLIMITED` o `UNKNOWN`, la capacidad es `null` y la UI declara
+el nivel en vez de inventar un infinito.
+
+### 5.4 Sesiones y encaje con la ventana
+
+`src/lib/domain/equivalents.ts`
+
+```
+tokens_por_sesión   = input_tokens + turnos × output_tokens
+sesiones_por_conv.  = floor(context_window / tokens_por_sesión)
+```
+
+El contexto **acumula** dentro de una sesión: la entrada se paga una vez y lo
+que se reenvía va cacheado. Por eso no es `turnos × (input + output)`.
+
+Veredicto de encaje (`assessFit`):
+
+| Estado | Cuándo | Significado |
+|---|---|---|
+| `FITS` | el material cabe con holgura | — |
+| `TIGHT` | solo cabe una sesión | Vas justo |
+| `SPLIT_REQUIRED` | no cabe de una sentada, pero se puede repartir | **Informativo**: más sesiones, más cuota |
+| `DOES_NOT_FIT` | no cabe ni por partes | **Bloqueante**: necesitas otra ventana |
+
+### 5.5 Qué restricción frena al usuario
+
+`resolveBindingConstraint()` en `subscription-vs-usage.ts`:
+
+```
+si el material no cabe ni por partes        → binding = context (bloqueante)
+si la cuota se agota con el uso declarado    → binding = quota
+si el material no cabe de una sentada        → binding = context (informativo)
+en otro caso                                 → binding = none
+```
+
+### 5.6 Recomendador
 
 `src/lib/recommender/wizard.ts`
 
@@ -253,6 +383,9 @@ score = calidad_para_la_necesidad(0..10)
       * 1.05                                 // bonus canal suscripción
       * 1.10                                 // bonus canal local
 ```
+
+El coste mensual estimado de la vía API usa el **perfil de trabajo** declarado,
+no una constante.
 
 ## 6. Convenciones del código
 
@@ -368,3 +501,12 @@ Nada de esto está bloqueando el MVP, pero está registrado para que no se pierd
 5. **Sin panel de administración** para las condiciones de suscripción.
 6. **Aviso de precio caducado** — `lastVerifiedDate` existe, la UI aún no lo
    muestra.
+7. **Entidad «plan» pendiente** — una suscripción es del *laboratorio*, no del
+   modelo: ChatGPT Plus da acceso a Astra, Sol y compañía. Hoy el precio vive
+   duplicado en el `AccessChannel` de cada modelo, así que comparar dos planes
+   de laboratorios distintos requiere comparar por par modelo+canal. El
+   modelo de dominio objetivo tiene una entidad `Plan` (ADR 023).
+8. **Números de cuota pendientes de verificar** — el seed publica el *nivel*
+   de cuota (ADR 020) porque los proveedores no siempre dan el número exacto.
+   Cuando lo publiquen, basta rellenar `estimatedMessageCap` y la capacidad
+   mensual se vuelve calculable sin tocar código.
