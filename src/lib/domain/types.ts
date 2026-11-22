@@ -44,6 +44,45 @@ export type WeightType =
   /** Pesos descargables con licencia OSI (Apache-2.0, MIT, etc.). */
   | "OPEN_WEIGHTS_PERMISSIVE";
 
+/**
+ * Nivel de cuota de un plan de suscripción.
+ *
+ * El binario "limitado / ilimitado" mentía: no hay ningún plan de $100/mes
+ * que sea realmente ilimitado, y los propios proveedores comunican sus planes
+ * con niveles ("very high", "high", "medium"). Además, un plan con fallback
+ * TIENE un límite por definición.
+ *
+ * El número exacto (`estimatedMessageCap`) solo es fuente de verdad cuando
+ * el nivel es numérico; para el resto, la capacidad no es calculable y la UI
+ * lo dice en lugar de inventar un infinito.
+ */
+export type QuotaLevel =
+  /** Sin techo conocido. */
+  | "UNLIMITED"
+  /** Cientos de mensajes por ventana. */
+  | "VERY_HIGH"
+  /** Decenas de mensajes por ventana. */
+  | "HIGH"
+  /** Entre 40 y 80 mensajes por ventana. */
+  | "MEDIUM"
+  /** Menos de 40 mensajes por ventana. */
+  | "LIMITED"
+  /** El proveedor no publica ni el nivel ni el número. */
+  | "UNKNOWN";
+
+/**
+ * Nivel de cuota y su etiqueta en lenguaje llano.
+ * El orden refleja la severidad: de más головiota a más restrictivo.
+ */
+export const QUOTA_LEVELS: readonly QuotaLevel[] = [
+  "UNLIMITED",
+  "VERY_HIGH",
+  "HIGH",
+  "MEDIUM",
+  "LIMITED",
+  "UNKNOWN",
+] as const;
+
 export interface ModelLifecycle {
   status: "PREVIEW" | "GA" | "DEPRECATED" | "LEGACY";
   /** Fecha de retirada si está deprecado. */
@@ -231,6 +270,17 @@ export interface AccessChannel {
   // ── Campos de suscripción (OFFICIAL_SUBSCRIPTION) ──
   monthlyPrice?: number;
   annualPrice?: number | null;
+  /**
+   * Nivel de cuota del plan. Obligatorio en canales de suscripción: sin él no
+   * se puede decir si el plan es "sin límite" (que casi nunca lo es) o si
+   * estamos inventando una capacidad.
+   */
+  quotaLevel?: QuotaLevel;
+  /**
+   * Nº de mensajes por ventana de reset. Solo es fuente de verdad cuando el
+   * nivel es numérico (LIMITED / MEDIUM / HIGH / VERY_HIGH). null = el
+   * proveedor no publica el número.
+   */
   estimatedMessageCap?: number | null;
   resetWindowHours?: number | null;
   fallbackModelOnLimit?: string | null;
@@ -252,6 +302,76 @@ export interface AccessChannel {
   setupDifficulty?: "facil" | "media" | "avanzada";
   /** Requisitos hardware resumidos para la UI. */
   localRequirements?: LocalRequirements;
+}
+
+// ─────────────────────────────────────────────────────────────
+// WORK PROFILES — el tipo de trabajo que el usuario hace
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Perfil de trabajo: QUÉ hace el usuario y con CUÁNTO material.
+ *
+ * Antes había dos ejes multiplicativos (tamaño × caso de uso) que se
+ * contradecían: "chat corto en programación" costaba más tokens que "chat
+ * corto en general". Ahora hay un solo eje y el contenido del caso de uso
+ * vive DENTRO del perfil.
+ *
+ * Cada perfil lleva una `reference` — un ejemplo real que el usuario
+ * reconoce — porque sin ella las cifras no significan nada para quien no
+ * sabe qué es un token.
+ */
+export interface WorkProfile {
+  key: string;
+  /** Etiqueta corta: "Revisión de código". */
+  label: string;
+  /** Ejemplo real de lo que el usuario manda. */
+  reference: string;
+  /** Tokens de entrada por intercambio. */
+  inputTokens: number;
+  /** Tokens de respuesta por intercambio. */
+  outputTokens: number;
+  /** Descripción larga para el Modo Técnico. */
+  description: string;
+}
+
+/**
+ * Cómo consume el usuario el material. Determina si la ventana de contexto es
+ * el límite real o si el material entra por bloques (herramientas, repo
+ * conectado).
+ */
+export type WorkMode =
+  /** El usuario pega solo lo que necesita en cada mensaje. */
+  | "PASTE"
+  /** El modelo tiene acceso al proyecto (herramientas, repo conectado). */
+  | "CONNECTED"
+  /** El usuario pega todo el material de golpe, de una sentada. */
+  | "ALL_AT_ONCE";
+
+// ─────────────────────────────────────────────────────────────
+// SESSION — la unidad de trabajo
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Resultado de cruzar la ventana de contexto con un perfil de trabajo.
+ *
+ * "Sesión" = un bloque de intercambios sobre un tema, en una conversación.
+ * Las sesiones que caben dependen del presupuesto del modelo; las que te da
+ * la cuota dependen del plan. Son restricciones ORTOGONALES: se agotan en
+ * momentos distintos, y la que frena al usuario es lo que hay que responder.
+ */
+export interface SessionBudget {
+  /** Perfil de trabajo usado para el cálculo. */
+  profile: WorkProfile;
+  /** Nº de sesiones de este tipo que caben en la ventana del modelo. */
+  sessionsPerConversation: number | null;
+  /** Tokens que consume una sesión completa de este tipo. */
+  tokensPerSession: number;
+  /** Tokens que puede ocupar la respuesta dentro del presupuesto. */
+  maxOutputTokens: number | null;
+  /** true si el material completo NO cabe en una sola conversación. */
+  doesNotFit: boolean;
+  /** true si el material cabe, pero con holgura mínima. */
+  tightFit: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -287,6 +407,14 @@ export interface ProviderOffer {
   throughputTps?: number;
   ttftSeconds?: number;
   quantization?: string;
+
+  /**
+   * Fecha de verificación de los precios de esta oferta. Obligatoria por
+   * ADR 013: toda cifra lleva `source` o `lastVerifiedDate`.
+   */
+  lastVerifiedDate?: string;
+  /** Procedencia del precio (página del proveedor, OpenRouter…). */
+  priceSource?: string;
 
   isOfficial: boolean;
   isRecommended: boolean;
