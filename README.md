@@ -9,6 +9,15 @@ de acceso).
 > oficiales de cada proveedor (fecha: 2026-11-22) y cada entrada lleva su
 > `source`. Los benchmarks proceden de las model cards y de Artificial Analysis.
 
+## Documentación
+
+| Documento | Para qué |
+|---|---|
+| [`AGENTS.md`](AGENTS.md) | **Documento principal de diseño.** Principios, modelo de dominio, fórmulas, convenciones de código y workflow. |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Cómo está construido: capas, estructura de ficheros, flujo de datos, extensiones. |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | Decisiones de diseño (ADR) con contexto, consecuencias y alternativas descartadas. |
+| Este README | Instalación, comandos y descripción del catálogo actual. |
+
 ## Stack
 
 | Capa | Tecnología |
@@ -82,7 +91,14 @@ src/
     models.ts                Capa de acceso a datos (normaliza y expone)
 
   __tests__/                 Tests de las fórmulas de negocio
+
+docs/
+  ARCHITECTURE.md            Cómo está construido (capas, flujo de datos)
+  DECISIONS.md               Decisiones de diseño (ADR) con alternativas
 ```
+
+`AGENTS.md` en la raíz es el **contrato de diseño** del proyecto: quien toque el
+código debe leerlo antes.
 
 ## Conceptos de dominio
 
