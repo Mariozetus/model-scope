@@ -11,8 +11,10 @@
 ```
 ┌───────────────────────────────────────────────────────────────┐
 │                        RUTAS (App Router)                     │
-│  /                    → home: Hero + Catálogo + Calc + Wizard  │
+│  /                    → home: Hero + Recomendador + Calc +   │
+│                         Catálogo                              │
 │  /modelos/[slug]      → Módulo B: ficha del modelo            │
+│  /laboratorios        → Módulo E: índice de labs y providers │
 └───────────────────────────────────────────────────────────────┘
                               │
 ┌───────────────────────────────────────────────────────────────┐
@@ -70,10 +72,12 @@ prisma/
 src/
   app/
     layout.tsx                 Shell, providers, metadata, <html data-mode>
-    page.tsx                   Home: Hero + Catálogo + Calculadora + Recomendador
+    page.tsx                   Home: Hero + Recomendador + Calculadora + Catálogo
     globals.css                Tailwind v4 + tokens + reglas por data-mode
     modelos/[slug]/
       page.tsx                 Módulo B — ficha del modelo
+    laboratorios/
+      page.tsx                 Módulo E — índice de laboratorios y proveedores
 
   components/
     ui/                        shadcn/ui (Base UI) — badge, button, card, dialog,
@@ -87,18 +91,18 @@ src/
     catalog.tsx                Módulo A — filtros por intención + render dual
     model-card.tsx             Tarjeta (Modo Práctico)
     technical-table.tsx        Tabla densa ordenable (Modo Técnico)
-    model-detail.tsx           Módulo B — radar, ficha, vías de acceso, local
+    model-detail.tsx           Módulo B — radar, capacidad, ficha, vías de acceso
     subscription-calculator.tsx Módulo C — la calculadora
-    recommender-wizard.tsx     Módulo D — wizard de 3 pasos
+    recommender-wizard.tsx     Módulo D — wizard de 4 pasos (entrada del comparador)
     score-bar.tsx              Barra de puntuación 0..10 (role="meter")
     privacy-badge.tsx          Semáforo + WeightBadge + LocalBadge
 
   lib/
     domain/
       types.ts                 Tipos del dominio (fuente de verdad)
-      constants.ts             Equivalentes humanos, perfiles de intensidad
+      constants.ts             Equivalentes humanos + perfiles de trabajo
       benchmarks.ts            13 benchmarks + descripciones en lenguaje llano
-      equivalents.ts           tokens → páginas / novelas
+      equivalents.ts           tokens → páginas / líneas / sesiones / presupuesto
     scoring/
       anchors.ts               PERCENTILE_TO_SCORE, BENCHMARK_CEILINGS, cohortConfidence
       cohort.ts                scoreByCohort() — el motor del 1..10
@@ -108,8 +112,8 @@ src/
     pricing/
       cost.ts                  Coste de tokens → USD
     calculator/
-      subscription-vs-usage.ts Fórmula del Módulo C
-      quota.ts                 Cuota → experiencia real
+      subscription-vs-usage.ts Fórmula del Módulo C + veredicto de restricción
+      quota.ts                 Cuota → experiencia real (por nivel)
     recommender/
       wizard.ts                Puntuación multicriterio del Módulo D
     format.ts                  Formateadores (tokens, dinero, fechas)
@@ -121,7 +125,7 @@ src/
 
   __tests__/
     scoring.test.ts            Normalización por cohorte, anclas, confianza
-    calculator.test.ts         Costes, veredicto, overflow
+    calculator.test.ts         Costes, veredicto, overflow, sesiones, presupuesto
 
 docs/
   ARCHITECTURE.md              Este documento
@@ -168,7 +172,9 @@ export interface EnrichedModel extends Model {
   percentiles: Record<string, number>;   // por benchmark
   cohortSizes: Record<string, number>;   // por benchmark
   speed: SpeedClassification;
-  capacity: ContextWindowTranslation;   // tokens → páginas/novelas
+  capacity: ContextWindowTranslation;   // tokens → páginas / líneas de código
+  budget: ContextBudget;                 // presupuesto entrada + salida (ADR 019)
+  materialCapacity: { label; detail };   // "Cabe un proyecto entero"
   subscriptions: AccessChannel[];
   apiChannels: AccessChannel[];
   localChannels: AccessChannel[];
@@ -186,9 +192,12 @@ API pública:
 | `getAllModelsSorted()` | Slugs para `generateStaticParams` |
 | `getFeaturedModels()` | Los destacados (Top 11 por defecto) |
 | `getCheapestApiPricing(model)` | El canal API más barato de un modelo |
+| `getApiPricings(model)` | Todas las vías de pago por uso, ordenadas por precio |
 | `getLocalRequirements(model)` | Requisitos de hardware (modelo o canal) |
 | `getLocalMonthlyCost(model)` | Coste de hardware estimado por mes |
 | `getSkillProfiles()` | `Map<modelId, SkillProfile>` para el recomendador |
+| `getLaboratoriesWithModels()` | Módulo E: laboratorios + sus modelos |
+| `getProvidersWithModels()` | Módulo E: proveedores + sus modelos |
 
 **Trampa conocida:** `getLocalRequirements` y compañía usan `?.` sobre
 `localChannels`. Los modelos propietarios no tienen canal local y un acceso
@@ -238,8 +247,9 @@ Ruta `src/app/modelos/[slug]/page.tsx`:
 1. `generateStaticParams()` devuelve los 19 slugs → prerenderizado estático.
 2. `generateMetadata()` genera el título y la descripción por modelo.
 3. `getModelBySlug(slug)`; si no existe → `notFound()`.
-4. Se renderizan: radar de habilidades, ficha técnica, tabla de vías de acceso,
-   comparativa multi-proveedor y la tarjeta de ejecución local.
+4. Se renderizan: capacidad de contexto, radar de habilidades, ficha técnica,
+   tabla de vías de acceso, comparativa multi-proveedor y la tarjeta de
+   ejecución local.
 
 **Cache Components y `params`:** la ruta accede a `params`, así que declara
 `export const instant = false`. Sin eso, Next.js 16 avisa de
@@ -249,11 +259,13 @@ contenido es una ficha completa y un esqueleto no aporta nada.
 ### 5.3 Calculadora (Módulo C)
 
 ```
-3 sliders (frecuencia · intensidad · caso de uso) + días laborables
-  → INTENSITY_PROFILES[intensity]         tokens input/output por interacción
-  → USE_CASE_MULTIPLIERS[useCase]          multiplicadores por caso
-  → calculateSubscriptionVsUsage()         fórmula pura
-  → veredicto + ahorro + overflow + mensajes por dólar
+perfil de trabajo + frecuencia + modo de consumo + días laborables
+  → WORK_PROFILES[profile]             tokens input/output por intercambio
+  → calculateSubscriptionVsUsage()      fórmula pura
+      ├─ comparativa suscripción vs API
+      ├─ overflow de cuota (si el nivel es numérico)
+      ├─ sesiones que caben en la ventana
+      └─ veredicto: ¿qué te va a frenar, la cuota o la ventana?
 ```
 
 `calculateSubscriptionVsUsage` es una **función pura**: sin `Date`, sin estado,
@@ -262,7 +274,7 @@ sin efectos. Es la fórmula más testeada del proyecto.
 ### 5.4 Recomendador (Módulo D)
 
 ```
-3 pasos (necesidad · presupuesto · privacidad)
+4 pasos (necesidad · material · presupuesto · privacidad)
   → construir candidatos (modelo + canal)
   → qualityForNeed(profile, need)          calidad 0..10 para la necesidad
   → budgetMultiplier()                      multiplicativo
@@ -272,7 +284,22 @@ sin efectos. Es la fórmula más testeada del proyecto.
 ```
 
 El candidato es **modelo + canal**, no solo modelo: por eso la respuesta es «este
-modelo, por esta vía, a este precio».
+modelo, por esta vía, a este precio». El coste estimado de la vía API usa el
+**perfil de trabajo** declarado, no una constante.
+
+### 5.5 Índice de laboratorios y proveedores (Módulo E)
+
+Ruta `src/app/laboratorios/page.tsx`:
+
+```
+LABORATORIES / PROVIDERS (seed)
+  → getLaboratoriesWithModels() / getProvidersWithModels()
+  → tarjetas con los modelos enlazados a sus fichas
+```
+
+Es un **índice de navegación** (ADR 022): no expone precios propios ni tablas
+de precios por proveedor. Solo responde a «qué modelos da cada laboratorio» y
+«qué ofrece cada proveedor».
 
 ## 6. Estado global y persistencia
 
@@ -331,13 +358,16 @@ testeable sin DOM.
 | Fichero | Cubre |
 |---|---|
 | `src/__tests__/scoring.test.ts` | `scoreByCohort`, `percentileToScore`, `cohortConfidence`, composición de skills |
-| `src/__tests__/calculator.test.ts` | `costOfInteraction`, `monthlyApiCost`, `calculateSubscriptionVsUsage`, overflow, veredicto |
+| `src/__tests__/calculator.test.ts` | `costOfInteraction`, `monthlyApiCost`, `calculateSubscriptionVsUsage`, overflow, veredicto, sesiones, presupuesto de contexto, niveles de cuota |
 
-35 tests en total. Bugs reales que los tests detectaron:
+53 tests en total. Bugs reales que los tests detectaron:
 
 1. El input cacheado se cobraba gratis cuando el proveedor no tenía precio de
    caché. Ahora se cobra a precio normal de input.
 2. `cohortConfidence` no era monótona entre `n = 2` y `n = 3`.
+3. `assessFit` devolvía siempre `SPLIT_REQUIRED` cuando el material no cabía:
+   el caso `DOES_NOT_FIT` ("no cabe ni por partes") era inalcanzable porque
+   ambas ramas compartían la misma condición.
 
 ## 10. Configuración de Next.js
 

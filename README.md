@@ -47,8 +47,9 @@ prisma/
 src/
   app/
     layout.tsx               Shell, providers, metadata
-    page.tsx                 Home: Hero + Catálogo + Calculadora + Recomendador
+    page.tsx                 Home: Hero + Recomendador + Calculadora + Catálogo
     modelos/[slug]/page.tsx  Módulo B — ficha del modelo
+    laboratorios/page.tsx    Módulo E — índice de laboratorios y proveedores
 
   components/
     providers/
@@ -61,18 +62,19 @@ src/
     catalog.tsx              Módulo A — filtros por intención + tarjetas/tabla
     model-card.tsx           Tarjeta (Modo Práctico)
     technical-table.tsx      Tabla densa ordenable (Modo Técnico)
-    model-detail.tsx         Módulo B — radar, ficha, vías de acceso, opción local
+    model-detail.tsx         Módulo B — capacidad, radar, ficha, vías de acceso
     subscription-calculator.tsx  Módulo C — la calculadora
-    recommender-wizard.tsx   Módulo D — wizard de 3 pasos
+    recommender-wizard.tsx   Módulo D — wizard de 4 pasos
     score-bar.tsx            Barra de puntuación 0..10
     privacy-badge.tsx        Semáforo de privacidad + badges de pesos/licencia
 
   lib/
     domain/
       types.ts               Tipos del dominio (glosario)
-      constants.ts           Equivalentes humanos y perfiles de intensidad
+      constants.ts           Equivalentes humanos + perfiles de trabajo
       benchmarks.ts          Metadatos de benchmarks
-      equivalents.ts         Traductor de capacidad (tokens → páginas)
+      equivalents.ts         Traductor de capacidad (tokens → páginas / líneas /
+                             sesiones / presupuesto)
     scoring/
       anchors.ts             Curva percentil→score, techos, confianza
       cohort.ts              Normalización por cohorte (el motor del 1-10)
@@ -81,8 +83,8 @@ src/
       normalize.ts           Utilidades numéricas
     pricing/cost.ts          Coste de tokens → USD
     calculator/
-      subscription-vs-usage.ts  Fórmula de la calculadora
-      quota.ts               Análisis de cuota → experiencia real
+      subscription-vs-usage.ts  Fórmula de la calculadora + veredicto de restricción
+      quota.ts               Análisis de cuota → experiencia real (por nivel)
     recommender/wizard.ts    Puntuación multicriterio del wizard
     format.ts                Formateadores
 
@@ -177,16 +179,46 @@ capacidad_mensual = estimated_message_cap * resets_por_mes
 overflow           = max(0, mensajes_usuario - capacidad_mensual)
 ```
 
+La capacidad mensual **solo es calculable** si el `quotaLevel` del plan es
+numérico. Los planes cuyo nivel no es numérico («Límite muy alto») declaran
+el nivel en vez de inventar un infinito.
+
+### Sesiones y encaje con la ventana
+
+```
+tokens_por_sesión  = input_tokens + turnos × output_tokens
+sesiones_por_conv. = floor(context_window / tokens_por_sesión)
+```
+
+El contexto **acumula** dentro de una sesión (la entrada se paga una vez; lo
+que se reenvía va cacheado). El encaje tiene cuatro estados:
+
+| Estado | Significado |
+|---|---|
+| `FITS` | el material cabe con holgura |
+| `TIGHT` | solo cabe una sesión |
+| `SPLIT_REQUIRED` | no cabe de una sentada, pero se puede repartir — **informativo** |
+| `DOES_NOT_FIT` | no cabe ni por partes — **bloqueante** |
+
 ### Veredicto de la calculadora
 
-La suscripción gana si **cubre el uso sin degradar** (o si es ilimitada) **y**
-cuesta menos. El overflow no encarece la suscripción pero degrada la calidad, así
-que penaliza el razonamiento, no el precio.
+La suscripción gana si **cubre el uso sin degradar** **y** cuesta menos. El
+overflow no encarece la suscripción pero degrada la calidad, así que penaliza
+el razonamiento, no el precio.
 
 ```
 si suscripción_cubre_y_más_barata   → winner = subscription
 si no_cubre_y_API_más_barata        → winner = usage (doble victoria)
 si empate                           → winner = tie
+```
+
+Y además, el veredicto de **qué te va a frenar**:
+
+```
+si el material no cabe ni por partes      → binding = context (bloqueante)
+si la cuota se agota con el uso declarado  → binding = quota
+si no cabe de una sentada                  → binding = context (informativo)
+en otro caso                               → binding = none
 ```
 
 ### Recomendador (Módulo D)
@@ -239,17 +271,36 @@ como pivote N:M), snapshots de precios (`PriceSnapshot`), trazas de sincronizaci
 
 ## Módulos
 
+- **D — Recomendador** (entrada): wizard de 4 pasos (necesidad · material ·
+  presupuesto · privacidad) → Top 3 combinaciones modelo + vía. Es la puerta
+  de entrada: responde «qué es lo que más me conviene» cuando el usuario aún no
+  sabe qué modelo quiere.
+- **C — Calculadora**: perfil de trabajo + frecuencia + días laborables.
+  Compara suscripción vs API, muestra ahorro, overflow de cuota, las sesiones
+  que caben por conversación y **qué restricción te va a frenar** (la cuota o
+  la ventana de contexto).
 - **A — Catálogo**: 11 destacados por defecto, expandible a 19. Filtros por
   intención (Programar / Escribir / Analizar PDFs / Razonar / Barato / Local).
   Alterna entre tarjetas (Práctico) y tabla densa ordenable (Técnico).
-- **B — Ficha del modelo**: radar de habilidades con percentiles, ficha técnica,
-  tabla «¿Dónde y cómo usarlo?» (gratis / suscripción / API / agregadores /
-  **local**) y comparativa multi-proveedor con los mejores en precio, velocidad
-  y latencia.
-- **C — Calculadora**: 3 sliders (frecuencia, intensidad, caso de uso) + días
-  laborables. Compara suscripción vs API, muestra ahorro, overflow de cuota y
-  «mensajes reales por dólar».
-- **D — Recomendador**: wizard de 3 pasos → Top 3 combinaciones modelo + proveedor.
+- **B — Ficha del modelo**: «cuánto cabe en una conversación» (presupuesto
+  repartido entre entrada y respuesta), radar de habilidades con percentiles,
+  ficha técnica, tabla «¿Dónde y cómo usarlo?» (gratis / suscripción / API /
+  agregadores / **local**) y comparativa multi-proveedor con los mejores en
+  precio, velocidad y latencia.
+- **E — Laboratorios y proveedores**: índice de navegación. Qué modelos da
+  cada laboratorio y qué ofrece cada proveedor. Sin precios propios.
+
+### Cómo se habla de la capacidad
+
+Los tokens son la unidad interna del cálculo y la unidad de medida del **precio**
+—siempre con la unidad explícita: «$8 por cada millón de tokens que le envías ·
+$40 por cada millón que te devuelve». Pero **nunca son una capacidad legible**:
+
+- La **capacidad** se expresa en el mundo del usuario: «Cabe un proyecto
+  entero», «~210.000 líneas de código», «~30 sesiones por conversación».
+- La **cuota** se expresa con su nivel real («Límite muy alto») en lugar de
+  inventar un «sin límite» que ningún plan de $100/mes cumple.
+- El usuario declara **trabajo** (qué hace y con cuánto material), no tokens.
 
 ## Accesibilidad
 
