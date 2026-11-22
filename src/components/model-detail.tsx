@@ -15,6 +15,7 @@ import { PrivacyBadge } from "@/components/privacy-badge";
 import { useMode } from "@/components/providers/mode-provider";
 import { cn } from "@/lib/utils";
 import { formatTokens } from "@/lib/format";
+import { QUOTA_LEVEL_LABELS } from "@/lib/domain/constants";
 import type { EnrichedModel } from "@/data/models";
 import type { AccessChannel } from "@/lib/domain/types";
 import { getCheapestApiPricing } from "@/data/models";
@@ -131,6 +132,25 @@ export function SkillRadar({ model }: { model: EnrichedModel }) {
 }
 
 /**
+ * Etiqueta de cuota de un plan.
+ *
+ * ADR 020: el binario "limitado / ilimitado" mentía. Se muestra el nivel
+ * declarado y, cuando el proveedor publica el número, también el detalle.
+ */
+function quotaLabel(subscription: AccessChannel): string {
+  const level = subscription.quotaLevel ?? "UNKNOWN";
+  const base = QUOTA_LEVEL_LABELS[level];
+
+  if (
+    subscription.estimatedMessageCap != null &&
+    subscription.resetWindowHours != null
+  ) {
+    return `${subscription.estimatedMessageCap} mensajes cada ${subscription.resetWindowHours} h · ${base.toLowerCase()}`;
+  }
+  return base;
+}
+
+/**
  * Tabla "¿Dónde y cómo usarlo?" — Módulo B.
  * Compara opción gratis, suscripción oficial y vías API / agregadores.
  */
@@ -177,12 +197,10 @@ export function AccessChannelsTable({ model }: { model: EnrichedModel }) {
               }
               privacySafe={subscription.trainsOnUserDataByDefault}
               highlights={[
-                subscription.estimatedMessageCap != null
-                  ? `${subscription.estimatedMessageCap} mensajes cada ${subscription.resetWindowHours}h`
-                  : "Sin límite de mensajes",
+                quotaLabel(subscription),
                 subscription.fallbackModelOnLimit
-                  ? `Degrada a ${subscription.fallbackModelOnLimit}`
-                  : "Sin degradación",
+                  ? `Al agotar la cuota, degrada a ${subscription.fallbackModelOnLimit}`
+                  : "Sin degradación por cuota",
                 `Herramientas: ${(subscription.includedTools ?? []).join(", ") || "ninguna"}`,
               ]}
               notes={subscription.notes}
@@ -197,8 +215,13 @@ export function AccessChannelsTable({ model }: { model: EnrichedModel }) {
             title={channel.name}
             subtitle="Pago por uso, sin cuota de mensajes"
             price={`$${channel.inputPricePer1M} / $${channel.outputPricePer1M}`}
-            priceSuffix="por 1M tokens"
+            priceSuffix="por cada millón de tokens"
             highlights={[
+              // Explica la unidad: el usuario tiene que saber que el primer
+              // número es lo que le cuesta ENVIAR y el segundo lo que le
+              // cuesta RECIBIR (ADR 017).
+              `Le envías: $${channel.inputPricePer1M} por millón de tokens`,
+              `Te devuelve: $${channel.outputPricePer1M} por millón de tokens`,
               channel.cachedInputPricePer1M != null
                 ? `Input cacheado: $${channel.cachedInputPricePer1M}/1M`
                 : "Sin precio de input cacheado",
@@ -220,8 +243,10 @@ export function AccessChannelsTable({ model }: { model: EnrichedModel }) {
                 : "Proveedor externo"
             }
             price={`$${offer.inputPricePer1M} / $${offer.outputPricePer1M}`}
-            priceSuffix="por 1M tokens"
+            priceSuffix="por cada millón de tokens"
             highlights={[
+              `Le envías: $${offer.inputPricePer1M} por millón de tokens`,
+              `Te devuelve: $${offer.outputPricePer1M} por millón de tokens`,
               offer.throughputTps != null
                 ? `${offer.throughputTps} tok/s${offer.ttftSeconds != null ? ` · TTFT ${offer.ttftSeconds}s` : ""}`
                 : "Velocidad no medida",
@@ -229,6 +254,11 @@ export function AccessChannelsTable({ model }: { model: EnrichedModel }) {
                 ? `Cuantización: ${offer.quantization}`
                 : "Precisión completa",
             ]}
+            notes={
+              offer.lastVerifiedDate
+                ? `Precio verificado el ${offer.lastVerifiedDate}`
+                : undefined
+            }
           />
         ))}
 
@@ -457,6 +487,115 @@ function ChannelCard({
   );
 }
 
+/**
+ * Capacidad de contexto — el "presupuesto de una conversación".
+ *
+ * ADR 019: la ventana es un presupuesto ÚNICO que la entrada y la salida
+ * comparten. El titular dice qué cabe; el detalle reparte el presupuesto.
+ */
+export function ContextCapacity({ model }: { model: EnrichedModel }) {
+  const { mode } = useMode();
+  const practical = mode === "practical";
+
+  const budget = model.budget;
+  if (budget.totalTokens == null) return null;
+
+  const outputTokens = budget.maxOutputTokens;
+  // El porcentaje se redondea hacia arriba cuando no llega al 1%: un
+  // "0% de la ventana" (8.192 tokens sobre 10M) es un dato sin sentido.
+  const rawShare =
+    outputTokens != null && budget.totalTokens > 0
+      ? (outputTokens / budget.totalTokens) * 100
+      : null;
+  const outputShare =
+    rawShare == null
+      ? null
+      : rawShare > 0 && rawShare < 1
+        ? "<1%"
+        : `${Math.round(rawShare)}%`;
+
+  return (
+    <Card className="p-5">
+      <h3 className="text-sm font-semibold">Cuánto cabe en una conversación</h3>
+
+      {/* Titular: qué cabe, en el mundo del usuario */}
+      {practical && model.materialCapacity && (
+        <div className="mt-3">
+          <p className="text-lg font-semibold tracking-tight">
+            {model.materialCapacity.label}
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {model.materialCapacity.detail}
+          </p>
+        </div>
+      )}
+
+      <div className="mt-4 space-y-3">
+        {/* Reparto del presupuesto (detalle b) */}
+        <div className="rounded-lg border border-border/60 bg-muted/30 p-3">
+          <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            Presupuesto de la conversación
+          </p>
+          <div className="mt-2 space-y-1.5">
+            <div className="flex items-baseline justify-between gap-3">
+              <span className="text-xs text-muted-foreground">
+                Puedes enviar
+              </span>
+              <span className="tabular text-xs font-medium">
+                {budget.usableInputTokens?.toLocaleString("es-ES")} tokens
+                {practical && model.capacity.codeLines > 0 && (
+                  <span className="ml-1 font-normal text-muted-foreground">
+                    (≈ {model.capacity.codeLines.toLocaleString("es-ES")} líneas
+                    de código)
+                  </span>
+                )}
+              </span>
+            </div>
+            <div className="flex items-baseline justify-between gap-3">
+              <span className="text-xs text-muted-foreground">
+                Puedes recibir
+              </span>
+              <span className="tabular text-xs font-medium">
+                {outputTokens != null
+                  ? `${outputTokens.toLocaleString("es-ES")} tokens`
+                  : "sin tope publicado"}
+                {outputShare != null && (
+                  <span className="ml-1 font-normal text-muted-foreground">
+                    (un {outputShare} de la ventana)
+                  </span>
+                )}
+              </span>
+            </div>
+          </div>
+          <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+            La entrada y la respuesta comparten el mismo presupuesto: lo que
+            mandes deja menos sitio para lo que recibes.
+          </p>
+        </div>
+
+        {/* Equivalentes */}
+        <div className="grid grid-cols-2 gap-3">
+          <div className="rounded-lg border border-border/60 p-3">
+            <p className="text-[11px] text-muted-foreground">En texto</p>
+            <p className="tabular mt-1 text-sm font-semibold">
+              ~{model.capacity.pages.toLocaleString("es-ES")} páginas
+            </p>
+          </div>
+          <div className="rounded-lg border border-border/60 p-3">
+            <p className="text-[11px] text-muted-foreground">En código</p>
+            <p className="tabular mt-1 text-sm font-semibold">
+              ~{model.capacity.codeLines.toLocaleString("es-ES")} líneas
+            </p>
+            <p className="mt-0.5 text-[11px] text-muted-foreground">
+              ≈ {model.capacity.codeFiles.toLocaleString("es-ES")} ficheros
+            </p>
+          </div>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 /** Ficha técnica del modelo. */
 export function SpecSheet({ model }: { model: EnrichedModel }) {
   const { mode } = useMode();
@@ -466,7 +605,12 @@ export function SpecSheet({ model }: { model: EnrichedModel }) {
 
   const rows: Array<{ label: string; value: string }> = practical
     ? [
-        { label: "Ventana de contexto", value: model.capacity.labelEs },
+        {
+          label: "Ventana de contexto",
+          value:
+            model.materialCapacity?.label ??
+            model.capacity.labelEs,
+        },
         { label: "Velocidad", value: model.speed.labelEs },
         {
           label: "Salida máxima",
@@ -604,14 +748,22 @@ export function ProviderComparison({ model }: { model: EnrichedModel }) {
 
   if (rows.length < 2) return null;
 
-  const cheapest = rows.reduce(
-    (best, r) => {
-      const rCost = (r.input ?? 0) + (r.output ?? 0);
-      const bestCost = (best.input ?? 0) + (best.output ?? 0);
-      return rCost < bestCost ? r : best;
-    },
-    rows[0],
-  );
+  /**
+   * Coste comparable: blended 3:1 (input:output), que es como se anuncian
+   * los precios. Antes se comparaba `input + output` sin ponderar, lo que
+   * inclinaba la balanza hacia el input y —peor— declaraba "más barato" al
+   * primero en un empate exacto.
+   */
+  const blended = (r: (typeof rows)[number]) =>
+    (3 * (r.input ?? 0) + (r.output ?? 0)) / 4;
+
+  const minBlended = Math.min(...rows.map(blended));
+  // Solo hay ganador si hay una diferencia real: un empate no se resalta.
+  const hasClearPriceWinner = rows.some((r) => blended(r) < minBlended);
+
+  const cheapest = hasClearPriceWinner
+    ? rows.reduce((best, r) => (blended(r) < blended(best) ? r : best), rows[0])
+    : null;
   const fastest = rows.reduce(
     (best, r) => ((r.tps ?? 0) > (best.tps ?? 0) ? r : best),
     rows[0],
@@ -669,7 +821,13 @@ export function ProviderComparison({ model }: { model: EnrichedModel }) {
                 </td>
                 <td className="tabular py-2 text-right">
                   {row.input != null ? (
-                    <span className={row === cheapest ? "font-semibold text-[var(--chart-5)]" : ""}>
+                    <span
+                      className={
+                        cheapest && row === cheapest
+                          ? "font-semibold text-[var(--chart-5)]"
+                          : ""
+                      }
+                    >
                       ${row.input}
                     </span>
                   ) : (
@@ -707,9 +865,15 @@ export function ProviderComparison({ model }: { model: EnrichedModel }) {
       </div>
 
       <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-muted-foreground">
-        <Legend color="text-[var(--chart-5)]">
-          Mejor precio: {cheapest.provider}
-        </Legend>
+        {cheapest ? (
+          <Legend color="text-[var(--chart-5)]">
+            Mejor precio: {cheapest.provider}
+          </Legend>
+        ) : (
+          <Legend color="text-muted-foreground">
+            Mismo precio en todos los proveedores
+          </Legend>
+        )}
         <Legend color="text-[var(--chart-1)]">
           Más rápido: {fastest.provider}
         </Legend>

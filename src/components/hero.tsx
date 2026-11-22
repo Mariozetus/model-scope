@@ -40,8 +40,9 @@ export function Hero({
         </p>
 
         <div className="mt-8 flex flex-wrap items-center gap-3">
-          <Button size="lg" nativeButton={false} render={<a href="#catalogo" />}>
-            Ver comparativa
+          <Button size="lg" nativeButton={false} render={<a href="#recomendador" />}>
+            <Sparkles className="size-4" aria-hidden />
+            Dime qué necesito y compáralo
           </Button>
           <Button
             size="lg"
@@ -58,15 +59,15 @@ export function Hero({
         <div className="mt-14 grid gap-6 border-t border-border/60 pt-10 sm:grid-cols-3">
           <Promise
             title="Sin jerga"
-            description="Cambia a Modo Práctico y lee: «capaz de leer ~400 páginas», «instantáneo», «top 15%»."
+            description="«Cabe un proyecto entero», «80 sesiones al día», «$20 al mes». Los tokens solo aparecen cuando son el precio."
           />
           <Promise
             title="Coste real"
-            description="Dinos cuánto usas y te decimos si te conviene una suscripción o el pago por uso."
+            description="Dinos cómo trabajas y te decimos si te conviene una suscripción, una API o el pago por uso."
           />
           <Promise
-            title="Contexto y privacidad"
-            description="Cuánto cabe de golpe y si el proveedor entrena con tus conversaciones."
+            title="Cuándo se te queda corto"
+            description="Te decimos si lo que te va a frenar es la cuota de mensajes o la ventana de contexto."
           />
         </div>
       </div>

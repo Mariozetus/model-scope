@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   AccessChannelsTable,
+  ContextCapacity,
   ProviderComparison,
   SkillRadar,
   SpecSheet,
@@ -100,7 +101,7 @@ export default async function ModelPage({ params }: PageProps<"/modelos/[slug]">
             {model.contextWindow != null && (
               <span className="text-xs text-muted-foreground">
                 Contexto: {formatTokens(model.contextWindow)} tokens ·{" "}
-                {model.capacity.shortLabel}
+                {model.materialCapacity?.label ?? model.capacity.shortLabel}
               </span>
             )}
           </div>
@@ -110,6 +111,7 @@ export default async function ModelPage({ params }: PageProps<"/modelos/[slug]">
       {/* Cuerpo */}
       <div className="grid gap-6 lg:grid-cols-[1fr_320px]">
         <div className="space-y-6">
+          <ContextCapacity model={model} />
           <AccessChannelsTable model={model} />
           <ProviderComparison model={model} />
         </div>

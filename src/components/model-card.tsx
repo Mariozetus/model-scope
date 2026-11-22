@@ -154,14 +154,17 @@ export function ModelCard({
           label={practical ? "Capacidad" : "Context"}
           value={
             practical
-              ? model.capacity.shortLabel
+              ? // La etiqueta cualitativa («Cabe un proyecto entero») sería la
+                // misma en casi todo el catálogo, así que la tarjeta muestra la
+                // ESCALA: lo que diferencia a un modelo de 262k de uno de 10M.
+                model.capacity.shortLabelCode
               : model.contextWindow != null
                 ? formatTokens(model.contextWindow)
                 : "—"
           }
           hint={
             practical
-              ? undefined
+              ? model.materialCapacity?.label
               : model.maxOutputTokens != null
                 ? `out ${formatTokens(model.maxOutputTokens)}`
                 : undefined

@@ -16,15 +16,13 @@ import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 import { formatMoney, formatNumber } from "@/lib/format";
 import {
-  INTENSITY_PROFILES,
-  INTENSITY_KEYS,
-  type IntensityKey,
-  type UseCaseKey,
+  DEFAULT_SESSION_TURNS,
+  SESSION_TURNS_RANGE,
+  WORK_PROFILES,
+  WORK_PROFILE_KEYS,
+  type WorkProfileKey,
 } from "@/lib/domain/constants";
-import {
-  calculateSubscriptionVsUsage,
-  USE_CASE_MULTIPLIERS,
-} from "@/lib/calculator/subscription-vs-usage";
+import { calculateSubscriptionVsUsage } from "@/lib/calculator/subscription-vs-usage";
 import { analyzeQuota } from "@/lib/calculator/quota";
 import type { EnrichedModel } from "@/data/models";
 import { getCheapestApiPricing, getCheapestSubscription } from "@/data/models";
@@ -33,8 +31,9 @@ import { useMode } from "@/components/providers/mode-provider";
 /**
  * Módulo C — Calculadora "¿Suscripción o Pago por Uso?".
  *
- * Tres deslizadores: frecuencia, intensidad y caso de uso. Compara el coste
- * fijo de la suscripción contra el coste real de la API para ese volumen.
+ * El usuario declara TRABAJO (perfil, frecuencia, cómo consume el material),
+ * no tokens. Los tokens son la unidad interna del cálculo y la unidad de
+ * medida del precio, nunca la unidad de una capacidad (ADR 017).
  */
 export function SubscriptionCalculator({
   models,
@@ -48,9 +47,9 @@ export function SubscriptionCalculator({
     models[0]?.slug ?? "",
   );
   const [messagesPerDay, setMessagesPerDay] = React.useState(20);
-  const [intensity, setIntensity] = React.useState<IntensityKey>("short");
-  const [useCase, setUseCase] = React.useState<UseCaseKey>("general");
+  const [profile, setProfile] = React.useState<WorkProfileKey>("code-review");
   const [workingDays, setWorkingDays] = React.useState(22);
+  const [sessionTurns, setSessionTurns] = React.useState(DEFAULT_SESSION_TURNS);
 
   const model = models.find((m) => m.slug === modelSlug) ?? models[0];
 
@@ -60,10 +59,16 @@ export function SubscriptionCalculator({
   const result = React.useMemo(() => {
     if (!model || !subscription || !apiPricing) return null;
     return calculateSubscriptionVsUsage(
-      { messagesPerDay, intensity, useCase, workingDaysPerMonth: workingDays },
+      {
+        messagesPerDay,
+        profile,
+        workingDaysPerMonth: workingDays,
+        sessionTurns,
+      },
       {
         monthlyPrice: subscription.monthlyPrice ?? 0,
         annualPrice: subscription.annualPrice,
+        quotaLevel: subscription.quotaLevel,
         estimatedMessageCap: subscription.estimatedMessageCap,
         resetWindowHours: subscription.resetWindowHours,
         fallbackModelOnLimit: subscription.fallbackModelOnLimit,
@@ -72,8 +77,21 @@ export function SubscriptionCalculator({
         freeTierQuotaNote: subscription.freeTierQuotaNote,
       },
       apiPricing,
+      {
+        contextWindow: model.contextWindow,
+        maxOutputTokens: model.maxOutputTokens,
+        name: model.name,
+      },
     );
-  }, [model, subscription, apiPricing, messagesPerDay, intensity, useCase, workingDays]);
+  }, [
+    model,
+    subscription,
+    apiPricing,
+    messagesPerDay,
+    profile,
+    workingDays,
+    sessionTurns,
+  ]);
 
   const quota = React.useMemo(() => {
     if (!subscription) return null;
@@ -152,21 +170,22 @@ export function SubscriptionCalculator({
             </p>
           </div>
 
-          {/* Intensidad */}
+          {/* Perfil de trabajo: QUÉ haces y con CUÁNTO material */}
           <div className="space-y-3">
-            <Label htmlFor="intensity">Tipo de uso</Label>
-            <div className="grid grid-cols-3 gap-2">
-              {INTENSITY_KEYS.map((key) => {
-                const profile = INTENSITY_PROFILES[key];
-                const active = intensity === key;
+            <Label htmlFor="profile">¿Qué tipo de trabajo haces?</Label>
+            <div className="grid gap-2 sm:grid-cols-3">
+              {WORK_PROFILE_KEYS.map((key, index) => {
+                const item = WORK_PROFILES.find((p) => p.key === key)!;
+                const active = profile === key;
                 return (
                   <button
                     key={key}
                     type="button"
-                    id={key === INTENSITY_KEYS[0] ? "intensity" : undefined}
-                    onClick={() => setIntensity(key)}
+                    id={index === 0 ? "profile" : undefined}
+                    onClick={() => setProfile(key)}
+                    aria-pressed={active}
                     className={cn(
-                      "rounded-lg border p-2.5 text-left transition-colors",
+                      "rounded-lg border p-3 text-left transition-colors",
                       "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                       active
                         ? "border-primary bg-primary/5"
@@ -174,11 +193,11 @@ export function SubscriptionCalculator({
                     )}
                   >
                     <div className="text-xs font-medium leading-tight">
-                      {profile.label}
+                      {item.label}
                     </div>
-                    <div className="tabular mt-1 text-[10px] text-muted-foreground">
-                      {formatNumber(profile.inputTokens)} /{" "}
-                      {formatNumber(profile.outputTokens)}
+                    {/* La referencia: sin ella, las cifras no significan nada */}
+                    <div className="mt-1 text-[11px] leading-snug text-muted-foreground">
+                      {item.reference}
                     </div>
                   </button>
                 );
@@ -186,29 +205,30 @@ export function SubscriptionCalculator({
             </div>
           </div>
 
-          {/* Caso de uso */}
-          <div className="space-y-3">
-            <Label htmlFor="usecase">Caso de uso principal</Label>
-            <Select
-              value={useCase}
-              onValueChange={(v) => {
-                if (v) setUseCase(v as UseCaseKey);
-              }}
-            >
-              <SelectTrigger id="usecase" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {(Object.keys(USE_CASE_MULTIPLIERS) as UseCaseKey[]).map(
-                  (key) => (
-                    <SelectItem key={key} value={key}>
-                      {USE_CASE_MULTIPLIERS[key].label}
-                    </SelectItem>
-                  ),
-                )}
-              </SelectContent>
-            </Select>
-          </div>
+          {/* Tamaño de sesión — solo en Modo Técnico (ADR 018) */}
+          {!practical && (
+            <div className="space-y-3">
+              <div className="flex items-baseline justify-between">
+                <Label htmlFor="turns">Intercambios por sesión</Label>
+                <span className="tabular text-sm font-semibold">
+                  {sessionTurns}
+                </span>
+              </div>
+              <Slider
+                id="turns"
+                min={SESSION_TURNS_RANGE.min}
+                max={SESSION_TURNS_RANGE.max}
+                step={SESSION_TURNS_RANGE.step}
+                value={sessionTurns}
+                onValueChange={(v) => setSessionTurns(v as number)}
+              />
+              <p className="text-xs text-muted-foreground">
+                Una sesión es un bloque de intercambios sobre un tema, en una
+                conversación. Define cuánto material cabe antes de que la
+                conversación se agote.
+              </p>
+            </div>
+          )}
 
           {/* Días laborables */}
           <div className="space-y-3">
@@ -289,10 +309,12 @@ export function SubscriptionCalculator({
               details={[
                 result.subscription.quotaLimited
                   ? `${formatNumber(result.subscription.messagesPerMonthCapacity ?? 0)} msgs/mes de cuota`
-                  : "Sin límite de mensajes",
+                  : quota?.levelLabel ?? "Límite no publicado",
                 result.subscription.overflowMessages > 0
                   ? `${formatNumber(result.subscription.overflowMessages)} msgs degradan a ${subscription.fallbackModelOnLimit ?? "modelo reducido"}`
-                  : "Sin degradación por cuota",
+                  : result.subscription.hasRealLimit
+                    ? "Sin degradación por cuota con este volumen"
+                    : "Sin degradación por cuota",
                 result.subscription.includedTools.length > 0
                   ? `Incluye: ${result.subscription.includedTools.join(", ")}`
                   : "Sin herramientas extra",
@@ -306,13 +328,56 @@ export function SubscriptionCalculator({
               monthlyCost={result.usage.monthlyCost}
               perMessage={result.usage.costPerMessage}
               details={[
-                `$${apiPricing.inputPer1M} / 1M tokens input`,
-                `$${apiPricing.outputPer1M} / 1M tokens output`,
+                `Le envías: $${apiPricing.inputPer1M} por millón de tokens`,
+                `Te devuelve: $${apiPricing.outputPer1M} por millón de tokens`,
                 `${formatNumber(result.usage.tokensPerMonth)} tokens al mes`,
               ]}
               highlighted={usageWins}
             />
           </div>
+
+          {/* ¿QUÉ RESTRICCIÓN TE VA A FRENAR? (ADR 018) */}
+          <Card
+            className={cn(
+              "p-4",
+              result.binding.constraint === "quota" &&
+                "border-[var(--privacy-caution)]/50",
+              result.binding.constraint === "context" &&
+                "border-[var(--chart-2)]/50",
+            )}
+          >
+            <h4 className="text-xs font-semibold text-muted-foreground">
+              ¿Qué te va a frenar?
+            </h4>
+            <p className="mt-2 text-sm">{result.binding.labelEs}</p>
+
+            {/* Sesiones: la unidad de trabajo (ADR 018) */}
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <Figure
+                label="Sesiones por conversación"
+                value={
+                  result.context.sessionsPerConversation != null
+                    ? `~${formatNumber(result.context.sessionsPerConversation)}`
+                    : "—"
+                }
+                hint={
+                  result.context.fitDetail ||
+                  `De "${WORK_PROFILES.find((p) => p.key === profile)?.label}"`
+                }
+              />
+              <Figure
+                label="Tokens por sesión"
+                value={`~${formatNumber(result.context.tokensPerSession)}`}
+                hint={`${sessionTurns} intercambios`}
+              />
+            </div>
+
+            {result.context.fitLevel === "DOES_NOT_FIT" && (
+              <p className="mt-3 text-xs font-medium text-[var(--privacy-caution)]">
+                {result.context.fitLabel}
+              </p>
+            )}
+          </Card>
 
           {/* Aviso de cuota */}
           {quota && !practical && (

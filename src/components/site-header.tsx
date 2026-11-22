@@ -11,6 +11,7 @@ const NAV = [
   { href: "/", label: "Catálogo" },
   { href: "/#calculadora", label: "Calculadora" },
   { href: "/#recomendador", label: "Recomendador" },
+  { href: "/laboratorios", label: "Laboratorios" },
 ];
 
 export function SiteHeader() {

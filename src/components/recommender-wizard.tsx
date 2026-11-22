@@ -10,6 +10,10 @@ import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import { formatMoney } from "@/lib/format";
 import {
+  getWorkProfile,
+  type WorkProfileKey,
+} from "@/lib/domain/constants";
+import {
   recommend,
   type BudgetTier,
   type RecommendationCandidate,
@@ -67,6 +71,34 @@ const STEP_NEED: Array<{
   },
 ];
 
+/**
+ * Perfil de trabajo: qué hace el usuario y con cuánto material.
+ *
+ * ADR 021: es un ÚNICO eje. Antes había dos multiplicadores que se
+ * contradecían y las cifras no significaban nada para el usuario.
+ */
+const STEP_PROFILE: Array<{
+  key: WorkProfileKey;
+  label: string;
+  reference: string;
+}> = [
+  {
+    key: "quick-question",
+    label: "Preguntas rápidas",
+    reference: "«¿Cómo centro un div?» — una duda de 3 líneas",
+  },
+  {
+    key: "code-review",
+    label: "Código",
+    reference: "un PR de ~500 líneas que revisar o corregir",
+  },
+  {
+    key: "repo-work",
+    label: "Repos y documentos",
+    reference: "el proyecto entero — decenas de miles de líneas",
+  },
+];
+
 const STEP_BUDGET: Array<{
   key: BudgetTier;
   label: string;
@@ -112,11 +144,12 @@ export function RecommenderWizard({
     budget: "twenty",
     privacy: "no-importa",
   });
+  const [profile, setProfile] = React.useState<WorkProfileKey>("code-review");
   const [done, setDone] = React.useState(false);
 
   const candidates = React.useMemo(
-    () => buildCandidates(models),
-    [models],
+    () => buildCandidates(models, profile),
+    [models, profile],
   );
 
   const profiles = React.useMemo(
@@ -241,15 +274,15 @@ export function RecommenderWizard({
           ¿Qué modelo necesitas?
         </h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          Tres preguntas rápidas y te digo qué contratar.
+          Cuatro preguntas rápidas y te digo qué contratar.
         </p>
       </div>
 
       {/* Progreso */}
       <div className="flex items-center gap-3">
-        <Progress value={((step + 1) / 3) * 100} className="h-1.5 flex-1" />
+        <Progress value={((step + 1) / 4) * 100} className="h-1.5 flex-1" />
         <span className="tabular text-xs text-muted-foreground">
-          {step + 1} / 3
+          {step + 1} / 4
         </span>
       </div>
 
@@ -278,6 +311,41 @@ export function RecommenderWizard({
 
         {step === 1 && (
           <StepContent
+            title="¿Con cuánto material trabajas?"
+            subtitle="Esto decide cuánto te va a costar y cuántas conversaciones necesitarás."
+          >
+            <div className="grid gap-3 sm:grid-cols-3">
+              {STEP_PROFILE.map((option) => (
+                <button
+                  key={option.key}
+                  type="button"
+                  onClick={() => setProfile(option.key)}
+                  aria-pressed={profile === option.key}
+                  className={cn(
+                    "relative rounded-xl border p-4 text-left transition-all",
+                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                    profile === option.key
+                      ? "border-primary bg-primary/5 shadow-sm"
+                      : "border-border hover:border-primary/40 hover:bg-muted/30",
+                  )}
+                >
+                  {profile === option.key && (
+                    <span className="absolute top-3 right-3 rounded-full bg-primary p-0.5 text-primary-foreground">
+                      <Check className="size-3" aria-hidden />
+                    </span>
+                  )}
+                  <div className="text-sm font-semibold">{option.label}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    {option.reference}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </StepContent>
+        )}
+
+        {step === 2 && (
+          <StepContent
             title="¿Cuánto quieres gastar al mes?"
             subtitle="Solo es una guía: ajustaremos el cálculo a tu uso real."
           >
@@ -297,7 +365,7 @@ export function RecommenderWizard({
           </StepContent>
         )}
 
-        {step === 2 && (
+        {step === 3 && (
           <StepContent
             title="¿Te importa la privacidad de tus datos?"
             subtitle="Si el proveedor entrena con tus conversaciones, lo sabrás."
@@ -330,8 +398,8 @@ export function RecommenderWizard({
             Atrás
           </Button>
 
-          {step < 2 ? (
-            <Button onClick={() => setStep((s) => Math.min(2, s + 1))}>
+          {step < 3 ? (
+            <Button onClick={() => setStep((s) => Math.min(3, s + 1))}>
               Siguiente
               <ArrowRight className="size-4" aria-hidden />
             </Button>
@@ -408,9 +476,17 @@ function OptionCard({
 /**
  * Construye los candidatos del recomendador: cada modelo × sus vías de acceso
  * (suscripción oficial y API barata), con su coste mensual estimado.
+ *
+ * ADR 023: el recomendador es la puerta de entrada del comparador. El coste
+ * de la vía API se estima con el perfil de trabajo declarado, no con una
+ * constante — así el ranking refleja el trabajo que el usuario hace.
  */
-function buildCandidates(models: EnrichedModel[]): RecommendationCandidate[] {
+function buildCandidates(
+  models: EnrichedModel[],
+  profile: WorkProfileKey,
+): RecommendationCandidate[] {
   const candidates: RecommendationCandidate[] = [];
+  const work = getWorkProfile(profile);
 
   for (const model of models) {
     const subscription = getCheapestSubscription(model);
@@ -428,17 +504,19 @@ function buildCandidates(models: EnrichedModel[]): RecommendationCandidate[] {
         monthlyCost: subscription.monthlyPrice,
         privacySafe: subscription.trainsOnUserDataByDefault === false,
         speedLabel: model.speed.labelEs,
-        contextLabel: model.capacity.shortLabel,
+        contextLabel: model.materialCapacity?.label ?? model.capacity.shortLabel,
       });
     }
 
     if (apiPricing) {
-      // Coste mensual estimado de la API para un usuario moderado:
-      // 20 mensajes/día × 22 días, chats cortos.
+      // Coste mensual estimado de la API con el perfil de trabajo declarado:
+      // 20 mensajes/día × 22 días.
       const messagesPerMonth = 20 * 22;
       const monthlyCost =
-        (messagesPerMonth * 800 / 1_000_000) * apiPricing.inputPer1M +
-        (messagesPerMonth * 400 / 1_000_000) * apiPricing.outputPer1M;
+        (messagesPerMonth * work.inputTokens / 1_000_000) *
+          apiPricing.inputPer1M +
+        (messagesPerMonth * work.outputTokens / 1_000_000) *
+          apiPricing.outputPer1M;
 
       candidates.push({
         modelId: model.id,
@@ -451,7 +529,7 @@ function buildCandidates(models: EnrichedModel[]): RecommendationCandidate[] {
         monthlyCost: Math.round(monthlyCost * 100) / 100,
         privacySafe: true,
         speedLabel: model.speed.labelEs,
-        contextLabel: model.capacity.shortLabel,
+        contextLabel: model.materialCapacity?.label ?? model.capacity.shortLabel,
       });
     }
 
@@ -471,7 +549,7 @@ function buildCandidates(models: EnrichedModel[]): RecommendationCandidate[] {
         monthlyCost: 0,
         privacySafe: true,
         speedLabel: model.speed.labelEs,
-        contextLabel: model.capacity.shortLabel,
+        contextLabel: model.materialCapacity?.label ?? model.capacity.shortLabel,
         localVramGb: req?.recommendedVramGb ?? req?.minVramGb ?? null,
         license: model.license,
       });
