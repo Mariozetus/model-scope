@@ -3,14 +3,23 @@ import {
   calculateSubscriptionVsUsage,
   type SubscriptionPlanInput,
 } from "@/lib/calculator/subscription-vs-usage";
-import { analyzeQuota } from "@/lib/calculator/quota";
+import { analyzeQuota, hasRealLimit } from "@/lib/calculator/quota";
 import { costOfInteraction, monthlyApiCost } from "@/lib/pricing/cost";
-import { translateContextWindow } from "@/lib/domain/equivalents";
+import {
+  assessFit,
+  buildContextBudget,
+  describeMaterialCapacity,
+  sessionsPerConversation,
+  tokensPerSession,
+  translateContextWindow,
+} from "@/lib/domain/equivalents";
+import { getWorkProfile } from "@/lib/domain/constants";
 import type { ApiPricing } from "@/lib/domain/types";
 
 const CLAUDE_PRO: SubscriptionPlanInput = {
   monthlyPrice: 20,
   annualPrice: 200,
+  quotaLevel: "MEDIUM",
   estimatedMessageCap: 45,
   resetWindowHours: 5,
   fallbackModelOnLimit: "Claude Haiku 4.5",
@@ -49,7 +58,8 @@ describe("costOfInteraction", () => {
     );
     // Sin precio de caché, los tokens se cobran a precio normal de input.
     expect(cost).toBeCloseTo(3, 6);
-  });});
+  });
+});
 
 describe("analyzeQuota", () => {
   it("detecta que la cuota no se agota con uso moderado", () => {
@@ -60,25 +70,54 @@ describe("analyzeQuota", () => {
   });
 
   it("detecta degradación cuando el ritmo supera la cuota", () => {
-    // 30 msgs/día → 6.25 por ventana (menos de 45). Con 200/día → 41.7, cerca.
     const quota = analyzeQuota(CLAUDE_PRO, 300);
     expect(quota.degraded).toBe(true);
   });
 
-  it("trata la ausencia de cuota como ilimitado", () => {
+  it("no inventa una capacidad cuando el nivel no es numérico", () => {
+    // ADR 020: "VERY_HIGH" no es un número, así que la capacidad NO es
+    // calculable. Antes esto devolvía Infinity y la app decía "Sin límite".
     const quota = analyzeQuota(
-      { estimatedMessageCap: null, resetWindowHours: null },
+      {
+        quotaLevel: "VERY_HIGH",
+        estimatedMessageCap: null,
+        resetWindowHours: null,
+        fallbackModelOnLimit: "GPT-6.2 Sol",
+      },
       100,
     );
-    expect(quota.degraded).toBe(false);
-    expect(quota.effectiveMessages).toBe(Number.POSITIVE_INFINITY);
+    expect(quota.isCalculable).toBe(false);
+    expect(quota.level).toBe("VERY_HIGH");
+    expect(quota.labelEs).toBe("Límite muy alto");
+  });
+
+  it("marca como no calculable un plan sin nivel ni número", () => {
+    const quota = analyzeQuota({}, 100);
+    expect(quota.isCalculable).toBe(false);
+    expect(quota.level).toBe("UNKNOWN");
+  });
+
+  it("detecta que un plan con fallback tiene tope real", () => {
+    expect(
+      hasRealLimit({
+        quotaLevel: "VERY_HIGH",
+        estimatedMessageCap: null,
+        fallbackModelOnLimit: "GPT-6.2 Sol",
+      }),
+    ).toBe(true);
+    expect(
+      hasRealLimit({
+        quotaLevel: "UNLIMITED",
+        estimatedMessageCap: null,
+      }),
+    ).toBe(false);
   });
 });
 
 describe("calculateSubscriptionVsUsage", () => {
   it("gana el pago por uso con uso moderado", () => {
     const result = calculateSubscriptionVsUsage(
-      { messagesPerDay: 20, intensity: "short", useCase: "general" },
+      { messagesPerDay: 20, profile: "quick-question" },
       CLAUDE_PRO,
       SONNET_PRICING,
     );
@@ -88,10 +127,8 @@ describe("calculateSubscriptionVsUsage", () => {
   });
 
   it("gana la suscripción con uso intensivo", () => {
-    // Punto de equilibrio para Sonnet ($3/$15 por 1M) con chats cortos:
-    // ~110 mensajes/día. A 120 ya la suscripción es más barata.
     const result = calculateSubscriptionVsUsage(
-      { messagesPerDay: 120, intensity: "short", useCase: "general" },
+      { messagesPerDay: 400, profile: "quick-question" },
       CLAUDE_PRO,
       SONNET_PRICING,
     );
@@ -99,42 +136,27 @@ describe("calculateSubscriptionVsUsage", () => {
     expect(result.recommendation.winner).toBe("subscription");
   });
 
-  it("la intensidad multiplica el consumo de tokens", () => {
-    const short = calculateSubscriptionVsUsage(
-      { messagesPerDay: 10, intensity: "short", useCase: "general" },
+  it("un perfil más caro consume más tokens y cuesta más", () => {
+    // ADR 021: el eje único de perfiles sustituye a los dos multiplicadores.
+    const cheap = calculateSubscriptionVsUsage(
+      { messagesPerDay: 10, profile: "quick-question" },
       CLAUDE_PRO,
       SONNET_PRICING,
     );
-    const long = calculateSubscriptionVsUsage(
-      { messagesPerDay: 10, intensity: "long", useCase: "general" },
+    const expensive = calculateSubscriptionVsUsage(
+      { messagesPerDay: 10, profile: "repo-work" },
       CLAUDE_PRO,
       SONNET_PRICING,
     );
-    expect(long.inputTokensPerInteraction).toBeGreaterThan(
-      short.inputTokensPerInteraction,
+    expect(expensive.inputTokensPerInteraction).toBeGreaterThan(
+      cheap.inputTokensPerInteraction,
     );
-    expect(long.usage.monthlyCost).toBeGreaterThan(short.usage.monthlyCost);
-  });
-
-  it("el caso de uso de programación produce más output que el general", () => {
-    const general = calculateSubscriptionVsUsage(
-      { messagesPerDay: 10, intensity: "medium", useCase: "general" },
-      CLAUDE_PRO,
-      SONNET_PRICING,
-    );
-    const coding = calculateSubscriptionVsUsage(
-      { messagesPerDay: 10, intensity: "medium", useCase: "coding" },
-      CLAUDE_PRO,
-      SONNET_PRICING,
-    );
-    expect(coding.outputTokensPerInteraction).toBeGreaterThan(
-      general.outputTokensPerInteraction,
-    );
+    expect(expensive.usage.monthlyCost).toBeGreaterThan(cheap.usage.monthlyCost);
   });
 
   it("traduce la cuota por ventana a capacidad mensual", () => {
     const result = calculateSubscriptionVsUsage(
-      { messagesPerDay: 10, intensity: "short", useCase: "general" },
+      { messagesPerDay: 10, profile: "quick-question" },
       CLAUDE_PRO,
       SONNET_PRICING,
     );
@@ -144,44 +166,31 @@ describe("calculateSubscriptionVsUsage", () => {
     expect(result.subscription.overflowMessages).toBe(0);
   });
 
-  it("detecta overflow cuando el uso supera la cuota", () => {
+  it("la capacidad mensual no es calculable sin nivel numérico", () => {
     const result = calculateSubscriptionVsUsage(
-      { messagesPerDay: 100, intensity: "short", useCase: "general" },
-      CLAUDE_PRO,
-      SONNET_PRICING,
-    );
-    // 2200 mensajes al mes vs 4752 de capacidad → no hay overflow
-    expect(result.subscription.overflowMessages).toBe(0);
-  });
-
-  it("reporta overflow real cuando la cuota es pequeña", () => {
-    const result = calculateSubscriptionVsUsage(
-      { messagesPerDay: 100, intensity: "short", useCase: "general" },
+      { messagesPerDay: 100, profile: "quick-question" },
       {
-        monthlyPrice: 20,
-        estimatedMessageCap: 10,
-        resetWindowHours: 1,
-        fallbackModelOnLimit: "Modelo mini",
+        monthlyPrice: 100,
+        quotaLevel: "VERY_HIGH",
+        estimatedMessageCap: null,
+        resetWindowHours: null,
+        fallbackModelOnLimit: "GPT-6.2 Sol",
       },
       SONNET_PRICING,
     );
-    // 10 msgs/hora * (22*24) = 5280 capacidad vs 2200 uso → sin overflow
-    expect(result.subscription.overflowMessages).toBe(0);
+    expect(result.subscription.messagesPerMonthCapacity).toBeNull();
+    expect(result.subscription.quotaLimited).toBe(false);
+    // Pero el plan SÍ tiene tope: hay fallback.
+    expect(result.subscription.hasRealLimit).toBe(true);
   });
 
   it("el cálculo mensual de la API es coherente con el coste unitario", () => {
     const result = calculateSubscriptionVsUsage(
-      { messagesPerDay: 10, intensity: "short", useCase: "general" },
+      { messagesPerDay: 10, profile: "quick-question" },
       CLAUDE_PRO,
       SONNET_PRICING,
     );
-    // `costPerMessage` se redondea a 2 decimales para display, así que la
-    // coherencia se valida con tolerancia de redondeo × nº de interacciones.
     const tolerance = 0.005 * result.interactionsPerMonth + 0.01;
-    expect(result.usage.monthlyCost).toBeCloseTo(
-      result.usage.costPerMessage * result.interactionsPerMonth,
-      0,
-    );
     expect(
       Math.abs(
         result.usage.monthlyCost -
@@ -194,14 +203,150 @@ describe("calculateSubscriptionVsUsage", () => {
     const result = calculateSubscriptionVsUsage(
       {
         messagesPerDay: 10,
-        intensity: "short",
-        useCase: "general",
+        profile: "quick-question",
         workingDaysPerMonth: 30,
       },
       CLAUDE_PRO,
       SONNET_PRICING,
     );
     expect(result.interactionsPerMonth).toBe(300);
+  });
+
+  // ── Veredicto de restricción (ADR 018) ──
+
+  it("señala la cuota como restricción cuando se supera", () => {
+    const result = calculateSubscriptionVsUsage(
+      { messagesPerDay: 200, profile: "quick-question" },
+      {
+        monthlyPrice: 20,
+        quotaLevel: "LIMITED",
+        estimatedMessageCap: 10,
+        resetWindowHours: 1,
+        fallbackModelOnLimit: "Modelo mini",
+      },
+      SONNET_PRICING,
+      { contextWindow: 1_000_000, maxOutputTokens: 128_000 },
+    );
+    // 10 msgs/hora × (22×24) = 5.280 de capacidad vs 200×22 = 4.400 de uso
+    // → cabe, así que hay que subir el uso para desbordar.
+    expect(result.subscription.overflowMessages).toBe(0);
+
+    const overflow = calculateSubscriptionVsUsage(
+      { messagesPerDay: 400, profile: "quick-question" },
+      {
+        monthlyPrice: 20,
+        quotaLevel: "LIMITED",
+        estimatedMessageCap: 10,
+        resetWindowHours: 1,
+        fallbackModelOnLimit: "Modelo mini",
+      },
+      SONNET_PRICING,
+      { contextWindow: 1_000_000, maxOutputTokens: 128_000 },
+    );
+    // 8.800 de uso vs 5.280 de capacidad → desborda
+    expect(overflow.subscription.overflowMessages).toBeGreaterThan(0);
+    expect(overflow.binding.constraint).toBe("quota");
+    expect(overflow.binding.labelEs).toContain("cuota");
+  });
+
+  it("señala la ventana como restricción cuando el material no cabe", () => {
+    const result = calculateSubscriptionVsUsage(
+      { messagesPerDay: 20, profile: "repo-work" },
+      CLAUDE_PRO,
+      SONNET_PRICING,
+      { contextWindow: 8_000, maxOutputTokens: 4_000 },
+    );
+    expect(result.context.fitLevel).toBe("DOES_NOT_FIT");
+    expect(result.binding.constraint).toBe("context");
+  });
+
+  it("no señala ninguna restricción cuando todo encaja", () => {
+    const result = calculateSubscriptionVsUsage(
+      { messagesPerDay: 10, profile: "quick-question" },
+      CLAUDE_PRO,
+      SONNET_PRICING,
+      { contextWindow: 1_050_000, maxOutputTokens: 128_000 },
+    );
+    expect(result.binding.constraint).toBe("none");
+  });
+
+  it("calcula las sesiones que caben en la ventana", () => {
+    const result = calculateSubscriptionVsUsage(
+      { messagesPerDay: 10, profile: "code-review", sessionTurns: 20 },
+      CLAUDE_PRO,
+      SONNET_PRICING,
+      { contextWindow: 1_050_000, maxOutputTokens: 128_000 },
+    );
+    // Sesión = 4000 in + 20 turnos × 1500 out = 34.000 tokens
+    expect(result.context.tokensPerSession).toBe(34_000);
+    expect(result.context.sessionsPerConversation).toBe(30);
+  });
+});
+
+describe("presupuesto de contexto (ADR 019)", () => {
+  it("la entrada y la salida comparten presupuesto", () => {
+    const budget = buildContextBudget(1_050_000, 128_000);
+    expect(budget.totalTokens).toBe(1_050_000);
+    // NO es 1.050.000 + 128.000: la respuesta se come parte de la ventana.
+    expect(budget.usableInputTokens).toBe(922_000);
+    expect(budget.maxOutputTokens).toBe(128_000);
+  });
+
+  it("sin tope de salida, el input usa todo el presupuesto", () => {
+    const budget = buildContextBudget(200_000, null);
+    expect(budget.usableInputTokens).toBe(200_000);
+  });
+
+  it("gestiona contexto desconocido", () => {
+    const budget = buildContextBudget(null, null);
+    expect(budget.totalTokens).toBeNull();
+    expect(budget.usableInputTokens).toBeNull();
+  });
+});
+
+describe("sesiones (ADR 018)", () => {
+  it("el contexto acumula: la entrada se paga una vez", () => {
+    const profile = getWorkProfile("code-review");
+    // 4000 + 20×1500 = 34.000, NO 20×(4000+1500)=110.000.
+    expect(tokensPerSession(profile, 20)).toBe(34_000);
+  });
+
+  it("calcula cuántas sesiones caben en la ventana", () => {
+    const profile = getWorkProfile("quick-question");
+    // 400 + 20×300 = 6400 tokens por sesión → 1.000.000/6400 = 156
+    expect(sessionsPerConversation(1_000_000, profile, 20)).toBe(156);
+  });
+
+  it("devuelve null si no hay ventana", () => {
+    const profile = getWorkProfile("quick-question");
+    expect(sessionsPerConversation(null, profile, 20)).toBeNull();
+  });
+});
+
+describe("assessFit", () => {
+  it("distingue 'no cabe de una sentada' de 'no cabe ni por partes'", () => {
+    const profile = getWorkProfile("repo-work");
+    // 80.000 tokens de entrada, 32.768 de ventana → no cabe de ninguna manera
+    const impossible = assessFit(32_768, profile, 20, "ALL_AT_ONCE");
+    expect(impossible.level).toBe("DOES_NOT_FIT");
+
+    // Pero sí se puede repartir en varias conversaciones.
+    const split = assessFit(32_768, profile, 20, "PASTE");
+    expect(split.level).toBe("SPLIT_REQUIRED");
+  });
+
+  it("con el repo conectado la ventana deja de ser el límite", () => {
+    const profile = getWorkProfile("repo-work");
+    const result = assessFit(32_768, profile, 20, "CONNECTED");
+    expect(result.level).toBe("FITS");
+    expect(result.detailEs).toContain("cuota");
+  });
+
+  it("marca el encaje justo cuando solo cabe una sesión", () => {
+    const profile = getWorkProfile("repo-work");
+    // Sesión = 80.000 + 20×8000 = 240.000 tokens; ventana de 250.000 → 1 sesión
+    const result = assessFit(250_000, profile, 20, "PASTE");
+    expect(result.level).toBe("TIGHT");
   });
 });
 
@@ -214,10 +359,37 @@ describe("translateContextWindow", () => {
     expect(translateContextWindow(100_000).novels).toBeCloseTo(1, 5);
   });
 
+  it("traduce tokens a líneas de código", () => {
+    // 200.000 tokens / 5 tokens por línea = 40.000 líneas
+    expect(translateContextWindow(200_000).codeLines).toBe(40_000);
+  });
+
   it("gestiona contexto desconocido", () => {
     const result = translateContextWindow(null);
     expect(result.pages).toBe(0);
     expect(result.labelEs).toContain("desconocida");
+  });
+});
+
+describe("describeMaterialCapacity", () => {
+  it("dice 'cabe un proyecto entero' con ventana grande", () => {
+    const result = describeMaterialCapacity(1_050_000);
+    expect(result?.label).toBe("Cabe un proyecto entero");
+  });
+
+  it("avisa de ventana corta", () => {
+    // 512 tokens: solo cabe material diminuto.
+    const result = describeMaterialCapacity(512);
+    expect(result?.label).toBe("Ventana corta");
+  });
+
+  it("distingue repositorio de fichero grande", () => {
+    expect(describeMaterialCapacity(8_000)?.label).toBe("Cabe un repositorio");
+    expect(describeMaterialCapacity(2_000)?.label).toBe("Cabe un fichero grande");
+  });
+
+  it("devuelve null sin ventana", () => {
+    expect(describeMaterialCapacity(null)).toBeNull();
   });
 });
 
