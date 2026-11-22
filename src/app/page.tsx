@@ -24,16 +24,21 @@ export default function HomePage() {
       <Hero stats={{ models: all.length, labs: 7, providers: 3 }} />
 
       <div className="mx-auto max-w-7xl space-y-20 px-4 pb-20 sm:px-6">
-        <Suspense fallback={<CatalogSkeleton />}>
-          <Catalog featured={featured} all={all} />
+        {/*
+          ADR 023: la app es un COMPARADOR. El recomendador sube a la posición
+          de entrada porque es lo que responde "¿qué es lo que más me
+          conviene?" cuando el usuario todavía no sabe qué modelo quiere.
+        */}
+        <Suspense fallback={<SectionSkeleton />}>
+          <RecommenderWizard models={all} />
         </Suspense>
 
         <Suspense fallback={<SectionSkeleton />}>
           <SubscriptionCalculator models={comparable} />
         </Suspense>
 
-        <Suspense fallback={<SectionSkeleton />}>
-          <RecommenderWizard models={all} />
+        <Suspense fallback={<CatalogSkeleton />}>
+          <Catalog featured={featured} all={all} />
         </Suspense>
       </div>
     </>
