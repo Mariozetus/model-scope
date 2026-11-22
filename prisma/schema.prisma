@@ -1,0 +1,378 @@
+// Prisma schema — AI Model & Access Comparator
+//
+// NOTA: el MVP corre sobre datos semilla en TypeScript (src/data/seed.ts)
+// y NO requiere base de datos. Este schema documenta el modelo relacional
+// objetivo y sirve de contrato para el siguiente paso (Postgres + Prisma).
+//
+// Para activarlo:
+//   1. npm i prisma @prisma/client
+//   2. npx prisma migrate dev --name init
+//   3. Sustituir src/data/models.ts por un repositorio Prisma que
+//      devuelva las mismas formas (EnrichedModel).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// LABORATORY — la entidad que entrena y publica el modelo base
+// ─────────────────────────────────────────────────────────────
+model Laboratory {
+  id          String   @id @default(cuid())
+  slug        String   @unique          // "openai", "anthropic"
+  name        String                    // "OpenAI"
+  websiteUrl  String?
+  country     String?                   // ISO-3166 alpha-2
+  foundedYear Int?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  models Model[]
+}
+
+// ─────────────────────────────────────────────────────────────
+// MODEL — la arquitectura/versión específica entrenada
+// ─────────────────────────────────────────────────────────────
+enum WeightType {
+  PROPRIETARY
+  OPEN_WEIGHTS_RESTRICTED
+  OPEN_WEIGHTS_PERMISSIVE
+}
+
+enum ModelLifecycle {
+  PREVIEW
+  GA
+  DEPRECATED
+  LEGACY
+}
+
+model Model {
+  id           String      @id @default(cuid())
+  slug         String      @unique      // "claude-3-7-sonnet"
+  name         String                   // "Claude 3.7 Sonnet"
+  laboratoryId String
+  laboratory   Laboratory  @relation(fields: [laboratoryId], references: [id], onDelete: Cascade)
+
+  // Identificadores externos para sincronización
+  openRouterId String?     @unique      // "anthropic/claude-3.7-sonnet"
+  apiModelId   String?                  // "claude-3-7-sonnet-20250219"
+
+  releasedAt   DateTime?
+  deprecatedAt DateTime?
+  lifecycle    ModelLifecycle @default(GA)
+  weightType   WeightType  @default(PROPRIETARY)
+  license      String?     // "MIT" | "Apache-2.0" | "Llama 4 Community" | null
+  /// true si la licencia es OSI (permite uso comercial sin condiciones)
+  isOsiLicense Boolean     @default(false)
+
+  // ── Capacidades intrínsecas ──
+  contextWindow     Int?
+  maxOutputTokens   Int?
+  modalities        String[] @default(["text"])
+  supportsTools     Boolean  @default(true)
+  supportsStreaming Boolean  @default(true)
+  supportsJSONMode  Boolean  @default(true)
+  supportsCaching   Boolean  @default(false)
+  /// true si el modelo se puede alojar en infraestructura propia
+  supportsSelfHosting Boolean @default(false)
+
+  // ── Curación editorial ──
+  summary          String?
+  practicalSummary String?
+  useCases         String[]  @default([])
+  isFeatured       Boolean   @default(false)
+  featuredOrder    Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  benchmarks      ModelBenchmark[]
+  scores          ModelScore[]
+  capabilities    ModelCapability[]
+  accessChannels  AccessChannel[]
+  providerOffers  ModelProvider[]
+  comparisons     ComparisonEntry[]
+  priceSnapshots  PriceSnapshot[]
+  localProfile    LocalProfile?
+
+  @@index([laboratoryId])
+  @@index([isFeatured, featuredOrder])
+  @@index([lifecycle])
+  @@index([useCases])
+}
+
+/// Requisitos de hardware para ejecutar el modelo en local.
+model LocalProfile {
+  id       String @id @default(cuid())
+  modelId  String @unique
+  model    Model  @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  /// Parámetros totales (para MoE, el total, no los activos)
+  totalParameters   BigInt?
+  /// Parámetros activos por token (solo MoE)
+  activeParameters  BigInt?
+  /// Tamaño de descarga en GB con cuantización Q4_K_M
+  downloadGbQ4      Float?
+  /// VRAM mínima recomendada en GB (contexto corto)
+  minVramGb         Float?
+  /// VRAM recomendada en GB (contexto 32k)
+  recommendedVramGb Float?
+  /// RAM del sistema si corre solo en CPU
+  cpuOnlyRamGb      Float?
+
+  /// Motores de ejecución compatibles (array)
+  runtimes          String[] @default([])
+  /// Comando de ejemplo
+  exampleCommand    String?
+
+  updatedAt DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────────────────────────
+// BENCHMARKS — métricas crudas de evaluación
+// ─────────────────────────────────────────────────────────────
+enum BenchmarkCategory {
+  REASONING
+  CODING
+  HUMAN_PREF
+  AGGREGATE
+  LONG_CONTEXT
+  MATH
+  VISION
+  MULTILINGUAL
+}
+
+model Benchmark {
+  id              String            @id @default(cuid())
+  slug            String            @unique   // "gpqa-diamond"
+  name            String
+  category        BenchmarkCategory
+  unit            String            @default("score") // "score" | "percent" | "elo"
+  plainDescription String?
+  createdAt       DateTime          @default(now())
+
+  results ModelBenchmark[]
+}
+
+model ModelBenchmark {
+  id          String   @id @default(cuid())
+  modelId     String
+  benchmarkId String
+  score       Float    // valor crudo, en la unidad del benchmark
+  source      String?  // "artificial-analysis@2026-11-20" | "manual"
+  measuredAt  DateTime?
+  isProjected Boolean  @default(false)
+
+  model     Model     @relation(fields: [modelId], references: [id], onDelete: Cascade)
+  benchmark Benchmark @relation(fields: [benchmarkId], references: [id], onDelete: Cascade)
+
+  @@unique([modelId, benchmarkId])
+  @@index([benchmarkId])
+}
+
+// ─────────────────────────────────────────────────────────────
+// SCORES — puntuaciones normalizadas 0..10 por habilidad
+// (materializado para consultas rápidas del catálogo)
+// ─────────────────────────────────────────────────────────────
+enum SkillDimension {
+  CODE
+  REASONING
+  WRITING
+  LANGUAGES
+  DATA_ANALYSIS
+  LONG_CONTEXT
+}
+
+model ModelScore {
+  id        String         @id @default(cuid())
+  modelId   String
+  dimension SkillDimension
+  value     Float          // 0..10
+  /// Componentes de la agregación, para trazabilidad/auditoría
+  breakdown Json?
+  /// Percentil dentro de la cohorte en el momento del cálculo
+  percentile Float?
+  /// Tamaño de la cohorte usada (para el factor de confianza)
+  cohortSize Int?
+  updatedAt DateTime       @updatedAt
+
+  model Model @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@unique([modelId, dimension])
+  @@index([dimension, value])
+}
+
+model ModelCapability {
+  id     String @id @default(cuid())
+  modelId String
+  key    String   // "tool_use", "vision", "web_search"
+  label  String
+  value  String?
+  weight Float    @default(1)
+
+  model Model @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@unique([modelId, key])
+}
+
+// ─────────────────────────────────────────────────────────────
+// PROVIDERS — canales de acceso de terceros
+// ─────────────────────────────────────────────────────────────
+enum ProviderKind {
+  AGGREGATOR
+  INFERENCE
+  CLOUD
+  FIRST_PARTY
+}
+
+model Provider {
+  id             String       @id @default(cuid())
+  slug           String       @unique   // "openrouter"
+  name           String
+  kind           ProviderKind
+  websiteUrl     String?
+  apiDocsUrl     String?
+  hasCatalogApi  Boolean      @default(false)
+  supportsOpenRouter Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  offers ModelProvider[]
+}
+
+/// Pivot: un modelo puede servirse por N providers con precios/velocidad distintos
+model ModelProvider {
+  id         String @id @default(cuid())
+  modelId    String
+  providerId String
+
+  inputPricePer1M       Float?
+  outputPricePer1M      Float?
+  cachedInputPricePer1M Float?
+
+  throughputTps Float?
+  ttftSeconds   Float?
+  quantization  String? // "fp16" | "fp8" | "awq" | "int8" | "int4"
+
+  isOfficial    Boolean @default(false)
+  isRecommended Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  model    Model    @relation(fields: [modelId], references: [id], onDelete: Cascade)
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@unique([modelId, providerId])
+  @@index([providerId])
+  @@index([modelId, isOfficial])
+}
+
+// ─────────────────────────────────────────────────────────────
+// ACCESS CHANNELS — vías de acceso de primera clase
+// ─────────────────────────────────────────────────────────────
+enum AccessChannelKind {
+  OFFICIAL_SUBSCRIPTION
+  FIRST_PARTY_API
+  THIRD_PARTY_API
+}
+
+model AccessChannel {
+  id          String            @id @default(cuid())
+  modelId     String
+  kind        AccessChannelKind
+  name        String            // "ChatGPT Plus", "API de Anthropic"
+  providerSlug String?
+  websiteUrl  String?
+
+  inputPricePer1M       Float?
+  outputPricePer1M      Float?
+  cachedInputPricePer1M Float?
+  currency              String  @default("USD")
+
+  throughputTps Float?
+  ttftSeconds   Float?
+  quantization  String?
+
+  // ── Campos de suscripción (solo OFFICIAL_SUBSCRIPTION) ──
+  monthlyPrice                Float?
+  annualPrice                 Float?
+  estimatedMessageCap         Int?
+  resetWindowHours            Int?
+  fallbackModelOnLimit        String?
+  trainsOnUserDataByDefault   Boolean @default(false)
+  includedTools               String[] @default([])
+  freeTier                    Boolean @default(false)
+  freeTierQuotaNote           String?
+  includedApiCredits          Float?
+  lastVerifiedDate            DateTime?
+  notes                       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  model Model @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@index([modelId, kind])
+  @@index([kind, monthlyPrice])
+}
+
+// ─────────────────────────────────────────────────────────────
+// COMPARADOR lado a lado (hasta 3 modelos)
+// ─────────────────────────────────────────────────────────────
+model Comparison {
+  id        String   @id @default(cuid())
+  sessionId String
+  label     String?
+  createdAt DateTime @default(now())
+
+  entries ComparisonEntry[]
+}
+
+model ComparisonEntry {
+  id           String     @id @default(cuid())
+  comparisonId String
+  modelId      String
+  position     Int        // 0..2
+
+  comparison Comparison @relation(fields: [comparisonId], references: [id], onDelete: Cascade)
+  model      Model      @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@unique([comparisonId, modelId])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Sincronización de datos automatizados
+// ─────────────────────────────────────────────────────────────
+model SyncRun {
+  id             String    @id @default(cuid())
+  source         String    // "openrouter"
+  status         String    // "success" | "partial" | "failed"
+  modelsSeen     Int       @default(0)
+  modelsUpserted Int       @default(0)
+  modelsChanged  Int       @default(0)
+  error          String?
+  startedAt      DateTime  @default(now())
+  finishedAt     DateTime?
+}
+
+/// Histórico de precios por provider+model, para detectar cambios de precio
+model PriceSnapshot {
+  id         String   @id @default(cuid())
+  modelId    String
+  providerId String
+  inputPricePer1M       Float
+  outputPricePer1M      Float
+  capturedAt DateTime @default(now())
+
+  model    Model    @relation(fields: [modelId], references: [id], onDelete: Cascade)
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([modelId, providerId, capturedAt])
+}
