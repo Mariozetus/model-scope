@@ -26,7 +26,7 @@ de acceso).
 | Estilos | Tailwind CSS v4 + shadcn/ui (Base UI) |
 | Estado | Context + `useSyncExternalStore` (sin librería externa) |
 | Datos | Seed en TypeScript → migrable a Prisma + PostgreSQL |
-| Tests | Vitest (35 tests sobre las fórmulas de negocio) |
+| Tests | Vitest (60 tests sobre las fórmulas de negocio) |
 
 ## Arrancar
 
@@ -174,14 +174,29 @@ Si el provider no ofrece precio de caché, los tokens cacheados se cobran a
 ### Capacidad de suscripción (de cuota por ventana a cuota mensual)
 
 ```
-resets_por_mes    = (días_laborables * 24) / reset_window_hours
+resets_por_mes    = reset_window_hours ? (días_laborables * 24) / reset_window_hours
+                                     : resetsPerMonth(quota_reset_period)
 capacidad_mensual = estimated_message_cap * resets_por_mes
 overflow           = max(0, mensajes_usuario - capacidad_mensual)
 ```
 
-La capacidad mensual **solo es calculable** si el `quotaLevel` del plan es
-numérico. Los planes cuyo nivel no es numérico («Límite muy alto») declaran
-el nivel en vez de inventar un infinito.
+La capacidad mensual **solo es calculable** si el plan:
+
+1. mide la cuota con un **tope por ventana** (`quotaKind: "WINDOWED"`),
+2. declara un **nivel numérico** (`quotaLevel` `LIMITED`/`MEDIUM`/`HIGH`/`VERY_HIGH`),
+3. **publica el número** de mensajes (`estimatedMessageCap`).
+
+Los planes cuyo nivel no es numérico («Límite muy alto») declaran el nivel en
+vez de inventar un infinito. Y los que miden la cuota de otra forma
+—multiplicadores («5x Pro usage»), tiers de herramientas («Expanded
+messages») o saldos compartidos (xAI)— **tampoco** son convertibles a
+mensajes: 5 veces un saldo que no conocemos no son 5 veces más mensajes.
+
+Verificado contra las páginas oficiales de precios (Anthropic, OpenAI, Google
+y xAI): **ningún proveedor publica un número de mensajes por ventana**, así
+que en la práctica la capacidad mensual no es calculable y la app lo dice.
+`resetsPerMonth()` traduce la periodicidad declarada a reinicios:
+`HOURLY`=720, `DAILY`=30, `WEEKLY`=30/7, `MONTHLY`=1, `UNKNOWN`=`null`.
 
 ### Sesiones y encaje con la ventana
 
@@ -299,7 +314,12 @@ $40 por cada millón que te devuelve». Pero **nunca son una capacidad legible**
 - La **capacidad** se expresa en el mundo del usuario: «Cabe un proyecto
   entero», «~210.000 líneas de código», «~30 sesiones por conversación».
 - La **cuota** se expresa con su nivel real («Límite muy alto») en lugar de
-  inventar un «sin límite» que ningún plan de $100/mes cumple.
+  inventar un «sin límite» que ningún plan de $100/mes cumple, **y con la
+  forma en que la mide el proveedor**: «múltiplo sobre un plan base», «niveles
+  de acceso por herramienta», «saldo de uso compartido». Dos planes con el
+  mismo nivel medidos de forma distinta no son magnitudes comparables, y la
+  ficha lo dice. El texto literal del proveedor se cita entrecomillado: es la
+  única fuente de verdad sobre sus límites.
 - El usuario declara **trabajo** (qué hace y con cuánto material), no tokens.
 
 ## Accesibilidad

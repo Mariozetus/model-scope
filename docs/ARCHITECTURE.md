@@ -263,13 +263,22 @@ perfil de trabajo + frecuencia + modo de consumo + días laborables
   → WORK_PROFILES[profile]             tokens input/output por intercambio
   → calculateSubscriptionVsUsage()      fórmula pura
       ├─ comparativa suscripción vs API
-      ├─ overflow de cuota (si el nivel es numérico)
+      ├─ overflow de cuota (solo si el plan es medible: ADR 024)
       ├─ sesiones que caben en la ventana
       └─ veredicto: ¿qué te va a frenar, la cuota o la ventana?
 ```
 
 `calculateSubscriptionVsUsage` es una **función pura**: sin `Date`, sin estado,
 sin efectos. Es la fórmula más testeada del proyecto.
+
+**Cuota medible (ADR 024):** la capacidad mensual solo se calcula si el plan
+declara `quotaKind: "WINDOWED"`, un `quotaLevel` numérico y un
+`estimatedMessageCap` publicado. Los planes medidos por multiplicador
+(«5x Pro usage»), por tiers de herramientas («Expanded messages») o por saldo
+compartido (xAI) devuelven `messagesPerMonthCapacity: null` — con su
+`quotaKind` y `quotaResetPeriod` disponibles para que la UI diga *por qué* no
+se puede calcular. `hasRealLimit` sigue respondiendo «¿existe un tope?» con
+independencia de si el tope es cuantificable.
 
 ### 5.4 Recomendador (Módulo D)
 
@@ -358,9 +367,9 @@ testeable sin DOM.
 | Fichero | Cubre |
 |---|---|
 | `src/__tests__/scoring.test.ts` | `scoreByCohort`, `percentileToScore`, `cohortConfidence`, composición de skills |
-| `src/__tests__/calculator.test.ts` | `costOfInteraction`, `monthlyApiCost`, `calculateSubscriptionVsUsage`, overflow, veredicto, sesiones, presupuesto de contexto, niveles de cuota |
+| `src/__tests__/calculator.test.ts` | `costOfInteraction`, `monthlyApiCost`, `calculateSubscriptionVsUsage`, overflow, veredicto, sesiones, presupuesto de contexto, niveles de cuota, forma de medición de la cuota (ADR 024), periodicidad del reset |
 
-53 tests en total. Bugs reales que los tests detectaron:
+60 tests en total. Bugs reales que los tests detectaron:
 
 1. El input cacheado se cobraba gratis cuando el proveedor no tenía precio de
    caché. Ahora se cobra a precio normal de input.

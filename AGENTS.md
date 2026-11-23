@@ -213,7 +213,7 @@ maxOutputTokens = 128.000    ← techo de la respuesta DENTRO del presupuesto
 La ficha lo presenta con el **titular** (qué cabe: «Cabe un proyecto entero») y
 el **detalle** (el reparto del presupuesto).
 
-### 3.11 La cuota tiene nivel explícito (ADR 020)
+### 3.11 La cuota tiene nivel explícito (ADR 020) y forma de medición (ADR 024)
 
 No hay ningún plan de $100/mes que sea realmente ilimitado, y si hay fallback
 **hay un límite por definición**. El dominio usa `QuotaLevel`
@@ -223,6 +223,37 @@ No hay ningún plan de $100/mes que sea realmente ilimitado, y si hay fallback
 Consecuencia operativa: cuando el nivel **no es numérico**, la capacidad
 mensual **no es calculable** y la UI lo dice. Devolver un infinito haría creer
 que el plan nunca se agota, y el error más caro es ese.
+
+**Pero el nivel no basta (ADR 024).** Verificado contra las páginas oficiales
+de precios (2026-11-22): **ningún proveedor publica un número de mensajes**,
+y cada uno mide su cuota de una forma distinta:
+
+| `QuotaKind` | Cómo mide el proveedor | Ejemplo real |
+|---|---|---|
+| `TIERED` | niveles de acceso por herramienta | ChatGPT Plus («Expanded messages») |
+| `MULTIPLIER` | un múltiplo de un plan base | Claude Max («5x Pro usage») |
+| `SHARED_POOL` | un saldo común a varios productos | xAI (pool Grok + Cursor) |
+| `WINDOWED` | un tope por ventana de tiempo | Claude Pro (ventana de 5 h) |
+| `UNDISCLOSED` | no publica nada verificable | — |
+
+Dos planes con el mismo nivel pero medidos de forma distinta **no son
+comparables**: un `HIGH` por tiers de herramientas y un `HIGH` por un saldo
+semanal son magnitudes diferentes. Por eso la ficha dice **cómo** mide el
+proveedor su cuota, y no solo cuánto limita.
+
+El dominio añade también:
+
+- **`QuotaResetPeriod`** (`HOURLY` | `DAILY` | `WEEKLY` | `MONTHLY` |
+  `UNKNOWN`) — cada cuánto se reinicia. Es imprescindible: con el mismo tope
+  nominal, un plan horario da ~25× más mensajes que uno semanal.
+- **`quotaDisclosure`** — el texto literal del proveedor. Es la única fuente de
+  verdad sobre los límites; la traducción a lenguaje llano es una
+  interpretación nuestra y el usuario puede tener otra lectura.
+
+**Regla dura:** solo un plan `WINDOWED` con número publicado es convertible a
+mensajes. `MULTIPLIER` («5x Pro usage») y `SHARED_POOL` no lo son aunque
+declaren un nivel alto: 5 veces un saldo que no conocemos no son 5 veces más
+mensajes.
 
 ### 3.12 Un solo eje de perfiles de trabajo (ADR 021)
 
@@ -264,13 +295,17 @@ Entidades clave:
 - **`AccessChannel`** — la unidad de comparación real. `kind` ∈
   `OFFICIAL_SUBSCRIPTION | FIRST_PARTY_API | THIRD_PARTY_API | LOCAL_SELF_HOSTED`.
   Contiene tanto precios por 1M como los campos de suscripción (precio mensual,
-  `quotaLevel`, cuota por ventana, horas de reset, fallback,
-  `trainsOnUserDataByDefault`).
+  `quotaLevel`, `quotaKind`, `quotaResetPeriod`, `quotaDisclosure`, cuota por
+  ventana, horas de reset, fallback, `trainsOnUserDataByDefault`).
 - **`Provider`** — agregador / inferencia / cloud / first-party.
 - **`LocalRequirements`** — VRAM, descarga Q4, parámetros, runtimes, comando.
 - **`SkillProfile`** — seis dimensiones (code, reasoning, writing, languages,
   data-analysis, long-context) normalizadas 0..10.
 - **`QuotaLevel`** — `UNLIMITED | VERY_HIGH | HIGH | MEDIUM | LIMITED | UNKNOWN`.
+- **`QuotaKind`** — `TIERED | MULTIPLIER | SHARED_POOL | WINDOWED |
+  UNDISCLOSED`: cómo mide el proveedor la cuota (ADR 024).
+- **`QuotaResetPeriod`** — `HOURLY | DAILY | WEEKLY | MONTHLY | UNKNOWN`:
+  cada cuánto se reinicia la cuota (ADR 024).
 - **`WorkProfile`** — perfil de trabajo: `reference` + tokens in/out.
 - **`WorkMode`** — `PASTE | CONNECTED | ALL_AT_ONCE`: cómo consume el material.
 
@@ -278,7 +313,7 @@ Entidades clave:
 
 | `kind` | Qué es | Qué tiene de especial |
 |---|---|---|
-| `OFFICIAL_SUBSCRIPTION` | Plan B2C de tarifa plana (ChatGPT Plus, Claude Pro…) | `quotaLevel`, cuota por ventana, fallback, entrenamiento con datos |
+| `OFFICIAL_SUBSCRIPTION` | Plan B2C de tarifa plana (ChatGPT Plus, Claude Pro…) | `quotaLevel`, `quotaKind`, `quotaResetPeriod`, `quotaDisclosure`, cuota por ventana, fallback, entrenamiento con datos |
 | `FIRST_PARTY_API` | Pago por uso directo al laboratorio | Precio por 1M input/output/cache |
 | `THIRD_PARTY_API` | Agregador o proveedor de inferencia | Precio + throughput + TTFT |
 | `LOCAL_SELF_HOSTED` | En tu propia infraestructura | Coste marginal 0, hardware real |
@@ -321,7 +356,8 @@ fue un bug real detectado por los tests.
 `src/lib/calculator/subscription-vs-usage.ts`
 
 ```
-resets_por_mes    = (días_laborables * 24) / reset_window_hours
+resets_por_mes    = reset_window_hours ? (días_laborables * 24) / reset_window_hours
+                                     : resetsPerMonth(quota_reset_period)
 capacidad_mensual = estimated_message_cap * resets_por_mes
 overflow           = max(0, mensajes_usuario - capacidad_mensual)
 ```
@@ -338,6 +374,21 @@ si empate                          → winner = tie
 es numérico (`LIMITED`/`MEDIUM`/`HIGH`/`VERY_HIGH`). Si el nivel es
 `VERY_HIGH`, `UNLIMITED` o `UNKNOWN`, la capacidad es `null` y la UI declara
 el nivel en vez de inventar un infinito.
+
+**Guarda de ADR 024:** además del nivel, la capacidad solo se calcula si la
+**forma de medición** lo permite (`quotaKind === "WINDOWED"`), si el proveedor
+publica el número (`estimatedMessageCap != null`) y si se conoce la
+periodicidad del reset. Un plan `MULTIPLIER` («5x Pro usage»), `TIERED`
+(«Expanded messages») o `SHARED_POOL` (saldo de xAI) **no** es convertible a
+mensajes aunque declare un nivel alto: multiplicar un saldo que no conocemos
+sería inventar la cifra.
+
+`resetsPerMonth()` (en `constants.ts`) traduce la periodicidad a reinicios:
+`HOURLY`=720, `DAILY`=30, `WEEKLY`=30/7, `MONTHLY`=1, `UNKNOWN`=`null`.
+
+**Distinción importante:** `hasRealLimit` (¿existe un tope?) es distinto de
+`quotaLimited` / `messagesPerMonthCapacity` (¿podemos cuantificarlo?). Un plan
+con fallback tiene tope aunque el proveedor no publique el número.
 
 ### 5.4 Sesiones y encaje con la ventana
 
@@ -506,7 +557,20 @@ Nada de esto está bloqueando el MVP, pero está registrado para que no se pierd
    duplicado en el `AccessChannel` de cada modelo, así que comparar dos planes
    de laboratorios distintos requiere comparar por par modelo+canal. El
    modelo de dominio objetivo tiene una entidad `Plan` (ADR 023).
-8. **Números de cuota pendientes de verificar** — el seed publica el *nivel*
-   de cuota (ADR 020) porque los proveedores no siempre dan el número exacto.
-   Cuando lo publiquen, basta rellenar `estimatedMessageCap` y la capacidad
-   mensual se vuelve calculable sin tocar código.
+8. **Números de cuota: nadie los publica** — se verificó contra las páginas
+   oficiales de precios de Anthropic, OpenAI, Google y xAI (2026-11-22):
+   **ningún proveedor publica un número de mensajes por ventana**. El seed
+   documenta el *nivel* (ADR 020), la *forma de medición* (`quotaKind`) y la
+   *periodicidad* (`quotaResetPeriod`) (ADR 024), y por eso la capacidad
+   mensual no es calculable para ningún plan real: el producto lo dice en vez
+   de inventar. Si algún proveedor publica el número, basta rellenar
+   `estimatedMessageCap` **y** declarar `quotaKind: "WINDOWED"`; la capacidad
+   se vuelve calculable sin tocar código.
+9. **Saldo compartido de xAI no modelado** — el pool de uso es común entre
+   Grok y Cursor, así que usar la CLI consume la cuota del chat. Está
+   documentado en `notes` del canal, pero el dominio no lo computa: hacerlo
+   exigiría un eje de «consumo mixto» que ningún otro proveedor exige.
+10. **Cifras de cuota no verificadas por el usuario** — el `quotaDisclosure`
+    cita al proveedor, pero nadie ha contrastado todavía si las cuentas
+    reales reciben más o menos que el texto oficial. Las páginas de precios
+    describen el plan, no el uso de una cuenta concreta.

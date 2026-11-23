@@ -40,6 +40,7 @@ revoque; no edites la anterior en silencio. El histórico es el valor.
 | [021](#021) | Perfiles de trabajo con referencia visible, sin multiplicadores opuestos | Aceptada |
 | [022](#022) | Módulo E (laboratorios y proveedores) es un índice, sin datos nuevos | Aceptada |
 | [023](#023) | La app es un comparador: el recomendador es la puerta de entrada | Aceptada |
+| [024](#024) | La cuota tiene forma de medición y periodicidad, no solo nivel | Aceptada |
 
 ---
 
@@ -1099,3 +1100,162 @@ suscripción con esta API» a «compara estas opciones entre sí».
 - **Crear un módulo nuevo «comparador».** Descartada: es una reorientación del
   C y del D, no una funcionalidad aparte — añadir un módulo nuevo es exactamente
   lo que §2 prohíbe sin discusión.
+
+---
+
+## 024 · La cuota tiene forma de medición y periodicidad, no solo nivel
+
+**Estado:** Aceptada · **Ámbito:** `src/lib/domain/types.ts`,
+`src/lib/domain/constants.ts`, `src/lib/calculator/quota.ts`,
+`src/lib/calculator/subscription-vs-usage.ts`, `src/data/seed.ts`
+
+### Contexto
+
+El ADR 020 Established que la cuota necesita un **nivel explícito** (`UNLIMITED`
+→ `LIMITED`) en lugar del binario «limitado / ilimitado». La razón era que
+ningún plan de $100/mes es realmente ilimitado y, si hay fallback, hay un
+límite por definición.
+
+Pero al verificar los niveles contra las **páginas oficiales de precios**
+(`claude.com/pricing`, `openai.com/chatgpt/pricing`,
+`one.google.com/about/google-ai-plans`, `x.ai/pricing` + `docs.x.ai`, el
+2026-11-22) apareció un problema peor que el que ADR 020 resolvió:
+
+**Cada proveedor mide su cuota de una forma distinta, y ninguna de esas formas
+es un número de mensajes.**
+
+| Proveedor | Cómo lo comunica | Qué publica |
+|---|---|---|
+| Anthropic | límites por ventana + multiplicador | Pro: «límites cada 5 horas y cada semana»; Max: «5x Pro usage»; Ultra: «sin límite de 5 horas», «10x» semanal |
+| OpenAI | tiers por herramienta | «Chats de texto ilimitados»; Plus: «Expanded messages»; Pro: «elige entre 3 niveles de uso» |
+| Google | multiplicador sobre el plan base | Plus: «2 veces más»; Pro: «4 veces más»; Ultra: «5 veces más que Pro» |
+| xAI | saldo compartido entre productos | «Un único saldo de uso de IA»; Premium: «4x Plus»; Super: «15x»; Ultra: «50x», con reset **semanal** |
+
+Las consecuencias del error eran concretas y graves:
+
+1. **La escala de niveles no era comparable entre proveedores.** Un `HIGH`
+   medido por tiers de herramientas (OpenAI) y un `HIGH` medido por un saldo
+   semanal (xAI) no son la misma magnitud. El dominio los trataba como
+   intercambiables.
+2. **La fórmula de capacidad mezclaba timers.** `resetWindowHours: null`
+   significaba «no aplica», pero en xAI **sí** aplica: es un pool **semanal**.
+   Con el mismo tope nominal, un plan horario da ~25× más mensajes que uno
+   semanal, y la fórmula no lo distinctions.
+3. **Un multiplicador no es un número de mensajes.** «5x Pro usage» es 5 veces
+   un saldo que no conocemos. Traducirlo a «5 veces más mensajes» es inventar.
+4. **Ningún proveedor publica un número de mensajes por ventana.** El seed
+   asumía un `estimatedMessageCap` con ventana de 5 h que en realidad no
+   existe en ninguna página oficial.
+5. **xAI había cambiado de producto.** SuperGrok ya no se vende (desde el
+   2026-10-12, «The X Subscription»); el plan de $30 pasó a llamarse
+   **X Premium** y da 4x el saldo del plan Plus de $8.
+
+### Decisión
+
+El **nivel** de cuota deja de ser suficiente. El dominio incorpora dos hechos
+que lo acompañan siempre, más el texto literal del proveedor:
+
+#### 1. `QuotaKind` — cómo mide el proveedor la cuota
+
+```ts
+export type QuotaKind =
+  | "TIERED"        // Niveles de acceso por herramienta/modelo
+  | "MULTIPLIER"    // Un múltiplo de un plan base ("5x Pro usage")
+  | "SHARED_POOL"   // Un saldo de uso común a varios productos
+  | "WINDOWED"      // Un tope por ventana de tiempo
+  | "UNDISCLOSED";  // El proveedor no publica nada verificable
+```
+
+#### 2. `QuotaResetPeriod` — cada cuánto se reinicia
+
+```ts
+export type QuotaResetPeriod =
+  | "HOURLY" | "DAILY" | "WEEKLY" | "MONTHLY" | "UNKNOWN";
+```
+
+Es imprescindible porque la capacidad mensual depende de **cuántas veces**
+se reinicia: `resetsPerMonth()` en `constants.ts` traduce la periodicidad a
+reinicios (HOURLY=720, DAILY=30, WEEKLY=30/7, MONTHLY=1, UNKNOWN=`null`).
+
+#### 3. `quotaDisclosure` — el texto literal del proveedor
+
+La única fuente de verdad sobre los límites es la redacción del proveedor.
+Se muestra en la ficha entrecomillada, porque la traducción a lenguaje llano
+es una **interpretación nuestra** y el usuario puede tener otra lectura.
+
+#### 4. Regla de capacidad: solo `WINDOWED` es convertible a mensajes
+
+```
+capacidad_mensual = estimatedMessageCap
+                   × (resetWindowHours ? (días_laborables × 24) / resetWindowHours
+                                       : resetsPerMonth(quotaResetPeriod))
+```
+
+y solo se calcula si, **además**:
+
+- `quotaKind === "WINDOWED"` — la forma de medición lo permite;
+- el nivel tiene número publicable (`LIMITED`/`MEDIUM`/`HIGH`/`VERY_HIGH`);
+- el proveedor publica el número (`estimatedMessageCap != null`);
+- se conoce la periodicidad (o la ventana en horas).
+
+Un plan `MULTIPLIER` con nivel `VERY_HIGH` **no** tiene capacidad calculable:
+la UI lo dice en lugar de inventar un infinito. Del mismo modo, `TIERED`
+(OpenAI) y `SHARED_POOL` (xAI) no son medibles aunque declaren un nivel alto.
+
+#### 5. `hasRealLimit` no depende de la medibilidad
+
+Un plan con fallback **tiene tope aunque el número no se publique**. Se
+mantiene la separación: `hasRealLimit` (¿existe un tope?) es distinto de
+`quotaLimited` / `messagesPerMonthCapacity` (¿podemos cuantificarlo?).
+
+#### 6. Planes reales añadidos al seed
+
+Con la verificación se Incorporaron los escalones que faltaban y que la
+comparación entre laboratorios necesitaba (ADR 023): **Claude Max** ($100) y
+**Claude Ultra** ($200) en Opus/Sonnet/Haiku, **Google AI Pro** ($19.99) en
+Carbon, **X Super** ($100) y **X Ultra** ($200) en Grok 4.7, más el
+renombrado de SuperGrok a **X Premium**.
+
+### Consecuencias
+
+- La ficha del modelo dice **cómo** mide el proveedor su cuota, no solo cuánto
+  limita. El usuario puede detectar que está comparando magnitudes distintas.
+- La calculadora devuelve `quotaKind` y `quotaResetPeriod` en el resultado,
+  para que la UI distinga «no lo sé» de «no lo tiene».
+- `estimatedMessageCap` sigue siendo `null` en el seed para **todos** los
+  planes reales: ningún proveedor publica el número. El campo queda como
+  capacidad de futuro (ADR 020 sigue vigente: cuando se publiquen, basta
+  rellenar el número).
+- Un plan `SHARED_POOL` de xAI tiene una limitación que el modelo de dominio
+  **no** captura: el saldo se comparte entre Grok y Cursor, así que el uso de
+  una CLI consume la cuota del chat. Se documenta en `notes`, pero no es
+  computable.
+- El comparador entre laboratorios (ADR 023) puede comparar **precios** de
+  planes de distintos proveedores, pero no **capacidades**: no hay una unidad
+  común entre un multiplicador de Anthropic y un saldo de xAI.
+
+### Alternativas descartadas
+
+- **Mantener solo el nivel y ampliar `QuotaLevel` con más valores**
+  (`TIERED`, `MULTIPLIER`…). Descartada: el nivel describe **cuánta** cuota
+  hay; la forma de medición describe **cómo se mide**. Son ejes distintos y
+  un plan puede tener nivel alto y forma `MULTIPLIER`. Meterlo todo en una
+  enumeración habría producido combinaciones imposibles (`MULTIPLIER` +
+  `LIMITED` no significa nada).
+- **Unificar los proveedores a una escala común de mensajes** (traducir «5x»
+  a un número inventado). Descartada: es exactamente el error que produce
+  cifras falsas con apariencia de dato. La app prefiere no calcular.
+- **Dejar `resetWindowHours: null` como «no aplica»** y mantener la fórmula
+  por ventanas. Descartada: en xAI la ventana sí aplica y es semanal; con la
+  fórmula antigua el pool de xAI habría parecido 720 veces más grande de lo
+  que es.
+- **Guardar el multiplicador como un número** (`quotaMultiplier: 5`) y
+  multiplicar la capacidad de Pro. Descartada: el multiplicador es relativo a
+  un saldo base que no se conoce, así que el producto sigue sin ser
+  calculable. Se guarda como **texto literal** (`quotaDisclosure`), que sí es
+  verdad y sí es comparable entre planes.
+- **Eliminar `QuotaLevel` y quedarse solo con la forma de medición.**
+  Descartada: el nivel sigue aportando la lectura de orden de magnitud que el
+  usuario necesita («límite alto» / «límite bajo»). La forma explica el *por
+  qué*; el nivel, el *cuánto*.
+
