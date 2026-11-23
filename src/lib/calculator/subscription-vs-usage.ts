@@ -14,9 +14,16 @@ import {
   DEFAULT_SESSION_TURNS,
   getWorkProfile,
   quotaLevelHasNumber,
+  resetsPerMonth,
   type WorkProfileKey,
 } from "@/lib/domain/constants";
-import type { ApiPricing, QuotaLevel, WorkMode } from "@/lib/domain/types";
+import type {
+  ApiPricing,
+  QuotaKind,
+  QuotaLevel,
+  QuotaResetPeriod,
+  WorkMode,
+} from "@/lib/domain/types";
 import { monthlyApiCost } from "@/lib/pricing/cost";
 import { round2 } from "@/lib/scoring/normalize";
 import { assessFit, sessionsPerConversation, tokensPerSession } from "@/lib/domain/equivalents";
@@ -44,6 +51,10 @@ export interface SubscriptionPlanInput {
   estimatedMessageCap?: number | null;
   /** Horas de la ventana de reset. null = no aplica. */
   resetWindowHours?: number | null;
+  /** Periodicidad del reset de la cuota (ADR 024). */
+  quotaResetPeriod?: QuotaResetPeriod;
+  /** Cómo mide el proveedor la cuota (ADR 024). */
+  quotaKind?: QuotaKind;
   fallbackModelOnLimit?: string | null;
   includedTools?: string[];
   freeTier?: boolean;
@@ -80,6 +91,10 @@ export interface CalculatorResult {
     hasRealLimit: boolean;
     /** Nivel de cuota del plan. */
     quotaLevel: QuotaLevel;
+    /** Cómo mide el proveedor la cuota. */
+    quotaKind: QuotaKind;
+    /** Periodicidad del reset de la cuota. */
+    quotaResetPeriod: QuotaResetPeriod;
     /** Coste por mensaje si la cuota es el factor limitante. */
     effectiveCostPerMessage: number | null;
     /** Mensajes que se degradarían a modelo fallback. */
@@ -142,17 +157,37 @@ export function calculateSubscriptionVsUsage(
     plan.annualPrice != null ? plan.annualPrice / 12 : null;
 
   const quotaLevel: QuotaLevel = plan.quotaLevel ?? "UNKNOWN";
+  const quotaKind: QuotaKind = plan.quotaKind ?? "UNDISCLOSED";
+  const quotaResetPeriod: QuotaResetPeriod = plan.quotaResetPeriod ?? "UNKNOWN";
 
   let messagesPerMonthCapacity: number | null = null;
-  if (
+
+  // La capacidad solo es calculable si el proveedor publica un NÚMERO y
+  // sabemos cada cuánto se reinicia. Sin el número, da igual saber el
+  // periodo: un "5x Pro usage" no son 5 veces más mensajes, son 5 veces
+  // más de un saldo que no conocemos.
+  //
+  // ADR 024: los proveedores miden la cuota de tres formas distintas
+  // (tiers, multiplicadores y saldos compartidos) y solo una de ellas
+  // (WINDOWED con número publicado) es convertible a mensajes.
+  const quotaIsMeasurable =
     plan.estimatedMessageCap != null &&
-    plan.resetWindowHours != null &&
-    quotaLevelHasNumber(quotaLevel)
-  ) {
-    const resetsPerMonth = (workingDaysPerMonth * 24) / plan.resetWindowHours;
-    messagesPerMonthCapacity = Math.round(
-      plan.estimatedMessageCap * resetsPerMonth,
-    );
+    quotaLevelHasNumber(quotaLevel) &&
+    quotaKind === "WINDOWED";
+
+  if (quotaIsMeasurable && plan.estimatedMessageCap != null) {
+    // Un plan con ventana en horas se reinicia cada `resetWindowHours`;
+    // si no, se usa la periodicidad declarada.
+    const resets =
+      plan.resetWindowHours != null && plan.resetWindowHours > 0
+        ? (workingDaysPerMonth * 24) / plan.resetWindowHours
+        : resetsPerMonth(quotaResetPeriod);
+
+    if (resets != null) {
+      messagesPerMonthCapacity = Math.round(
+        plan.estimatedMessageCap * resets,
+      );
+    }
   }
 
   const quotaLimited = messagesPerMonthCapacity != null;
@@ -286,6 +321,8 @@ export function calculateSubscriptionVsUsage(
       quotaLimited,
       hasRealLimit,
       quotaLevel,
+      quotaKind,
+      quotaResetPeriod,
       effectiveCostPerMessage,
       overflowMessages,
       includedTools: plan.includedTools ?? [],

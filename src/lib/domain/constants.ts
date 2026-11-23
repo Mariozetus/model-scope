@@ -5,7 +5,12 @@
  * Centralizarlos aquí permite auditarlos y cambiarlos de un solo sitio.
  */
 
-import type { QuotaLevel, WorkProfile } from "@/lib/domain/types";
+import type {
+  QuotaKind,
+  QuotaLevel,
+  QuotaResetPeriod,
+  WorkProfile,
+} from "@/lib/domain/types";
 
 /** Equivalentes legibles por humanos (glosario del brief). */
 export const HUMAN_EQUIVALENTS = {
@@ -115,6 +120,60 @@ export const QUOTA_LEVEL_DESCRIPTIONS: Record<QuotaLevel, string> = {
   LIMITED: "Menos de 40 mensajes por cada ventana de unas horas.",
   UNKNOWN: "El proveedor no publica ni el nivel ni el número de mensajes.",
 };
+
+/**
+ * Cómo mide el proveedor la cuota — etiqueta en lenguaje llano.
+ *
+ * ADR 024: la forma de la cuota es tan parte del dato como su nivel. Un plan
+ * con "Límite alto" medido por tiers de herramientas y otro medido por un
+ * pool semanal no son comparables aunque compartan etiqueta.
+ */
+export const QUOTA_KIND_LABELS: Record<QuotaKind, string> = {
+  TIERED: "Niveles de acceso por herramienta",
+  MULTIPLIER: "Múltiplo sobre un plan base",
+  SHARED_POOL: "Saldo de uso compartido entre productos",
+  WINDOWED: "Tope por ventana de tiempo",
+  UNDISCLOSED: "El proveedor no publica sus límites",
+};
+
+/**
+ * Etiquetas de la periodicidad del reset.
+ */
+export const QUOTA_RESET_LABELS: Record<QuotaResetPeriod, string> = {
+  HOURLY: "se reinicia varias veces al día",
+  DAILY: "se reinicia cada día",
+  WEEKLY: "se reinicia cada semana",
+  MONTHLY: "se reinicia cada mes",
+  UNKNOWN: "el proveedor no publica cuándo se reinicia",
+};
+
+/**
+ * Cuántas veces se reinicia la cuota al mes, según su periodicidad.
+ *
+ * Es el dato que convierte "un tope por ventana" en "mensajes al mes". Sin
+ * él, la fórmula de capacidad mezcla timers: un pool semanal da ~4,3
+ * reinicios al mes y uno de 5 horas, ~105 — 25× más mensajes con el mismo
+ * tope nominal.
+ *
+ * Se usa un mes de 30 días. La diferencia con 30,4 días es marginal para
+ * una estimación que el proveedor no publica con precisión.
+ */
+export function resetsPerMonth(period: QuotaResetPeriod): number | null {
+  switch (period) {
+    case "HOURLY":
+      // 30 días × 24 h. No se divide por la ventana: el `resetWindowHours`
+      // ya expresa el tamaño de la ventana.
+      return 30 * 24;
+    case "DAILY":
+      return 30;
+    case "WEEKLY":
+      return 30 / 7;
+    case "MONTHLY":
+      return 1;
+    case "UNKNOWN":
+      return null;
+  }
+}
 
 /**
  * ¿El nivel de cuota tiene un número publicable?

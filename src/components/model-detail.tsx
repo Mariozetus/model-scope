@@ -15,7 +15,7 @@ import { PrivacyBadge } from "@/components/privacy-badge";
 import { useMode } from "@/components/providers/mode-provider";
 import { cn } from "@/lib/utils";
 import { formatTokens } from "@/lib/format";
-import { QUOTA_LEVEL_LABELS } from "@/lib/domain/constants";
+import { QUOTA_KIND_LABELS, QUOTA_LEVEL_LABELS } from "@/lib/domain/constants";
 import type { EnrichedModel } from "@/data/models";
 import type { AccessChannel } from "@/lib/domain/types";
 import { getCheapestApiPricing } from "@/data/models";
@@ -136,18 +136,23 @@ export function SkillRadar({ model }: { model: EnrichedModel }) {
  *
  * ADR 020: el binario "limitado / ilimitado" mentía. Se muestra el nivel
  * declarado y, cuando el proveedor publica el número, también el detalle.
+ *
+ * ADR 024: el nivel solo no basta. Dos planes con el mismo nivel pero medidos
+ * de forma distinta (tiers de herramientas vs. saldo semanal) no son
+ * comparables, así que se dice CÓMO lo mide el proveedor.
  */
 function quotaLabel(subscription: AccessChannel): string {
   const level = subscription.quotaLevel ?? "UNKNOWN";
   const base = QUOTA_LEVEL_LABELS[level];
+  const kind = subscription.quotaKind ?? "UNDISCLOSED";
 
-  if (
+  const detail =
     subscription.estimatedMessageCap != null &&
     subscription.resetWindowHours != null
-  ) {
-    return `${subscription.estimatedMessageCap} mensajes cada ${subscription.resetWindowHours} h · ${base.toLowerCase()}`;
-  }
-  return base;
+      ? `${subscription.estimatedMessageCap} mensajes cada ${subscription.resetWindowHours} h`
+      : QUOTA_KIND_LABELS[kind].toLowerCase();
+
+  return `${detail} · ${base.toLowerCase()}`;
 }
 
 /**
@@ -198,6 +203,12 @@ export function AccessChannelsTable({ model }: { model: EnrichedModel }) {
               privacySafe={subscription.trainsOnUserDataByDefault}
               highlights={[
                 quotaLabel(subscription),
+                // La redacción literal del proveedor: la traducción a
+                // lenguaje llano es una interpretación nuestra, y el usuario
+                // puede tener otra lectura.
+                ...(subscription.quotaDisclosure
+                  ? [`El proveedor dice: «${subscription.quotaDisclosure}»`]
+                  : []),
                 subscription.fallbackModelOnLimit
                   ? `Al agotar la cuota, degrada a ${subscription.fallbackModelOnLimit}`
                   : "Sin degradación por cuota",

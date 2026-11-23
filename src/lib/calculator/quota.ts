@@ -5,14 +5,27 @@
  * ADR 020: la cuota tiene un NIVEL explícito. El binario "limitado /
  * ilimitado" mentía — no hay ningún plan de $100/mes que sea realmente
  * ilimitado, y si hay fallback, hay un límite por definición.
+ *
+ * ADR 024: el nivel no basta. Cada proveedor mide su cuota de una forma
+ * distinta (tiers de acceso, multiplicadores, saldos compartidos) y con
+ * periodicidades distintas (horaria, diaria, semanal). Un plan con "Límite
+ * alto" medido por tiers de herramientas no es comparable con otro medido
+ * por un pool semanal, aunque compartan etiqueta.
  */
 
 import {
+  QUOTA_KIND_LABELS,
   QUOTA_LEVEL_DESCRIPTIONS,
   QUOTA_LEVEL_LABELS,
+  QUOTA_RESET_LABELS,
   quotaLevelHasNumber,
+  resetsPerMonth,
 } from "@/lib/domain/constants";
-import type { QuotaLevel } from "@/lib/domain/types";
+import type {
+  QuotaKind,
+  QuotaLevel,
+  QuotaResetPeriod,
+} from "@/lib/domain/types";
 
 export interface QuotaBudget {
   /** Mensajes "de calidad" garantizados antes de degradar. */
@@ -33,11 +46,19 @@ export interface QuotaBudget {
   levelLabel: string;
   /** Descripción larga del nivel. */
   levelDescription: string;
+  /** Cómo mide el proveedor la cuota. */
+  kind: QuotaKind;
+  /** Etiqueta de la periodicidad del reset. */
+  resetLabel: string;
+  /** Periodicidad declarada. */
+  resetPeriod: QuotaResetPeriod;
 }
 
 /** Entrada del análisis de cuota: un plan y su nivel declarado. */
 export interface QuotaPlan {
   quotaLevel?: QuotaLevel;
+  quotaKind?: QuotaKind;
+  quotaResetPeriod?: QuotaResetPeriod;
   estimatedMessageCap?: number | null;
   resetWindowHours?: number | null;
   fallbackModelOnLimit?: string | null;
@@ -52,12 +73,18 @@ export interface QuotaPlan {
  * Cuando el nivel no es numérico (VERY_HIGH, UNLIMITED, UNKNOWN) NO hay
  * capacidad calculable: se dice explícitamente en vez de devolver un
  * infinito que haría creer que el plan nunca se agota.
+ *
+ * ADR 024: un plan `MULTIPLIER` ("5x Pro usage") o `TIERED` ("Expanded
+ * messages") no es convertible a mensajes aunque declare un nivel alto.
+ * Solo un `WINDOWED` con número publicado lo es.
  */
 export function analyzeQuota(
   plan: QuotaPlan,
   messagesPerDay: number,
 ): QuotaBudget {
   const level: QuotaLevel = plan.quotaLevel ?? "UNKNOWN";
+  const kind: QuotaKind = plan.quotaKind ?? "UNDISCLOSED";
+  const resetPeriod: QuotaResetPeriod = plan.quotaResetPeriod ?? "UNKNOWN";
   const cap = plan.estimatedMessageCap;
   const window = plan.resetWindowHours;
 
@@ -65,14 +92,20 @@ export function analyzeQuota(
     level,
     levelLabel: QUOTA_LEVEL_LABELS[level],
     levelDescription: QUOTA_LEVEL_DESCRIPTIONS[level],
+    kind,
+    resetLabel: QUOTA_RESET_LABELS[resetPeriod],
+    resetPeriod,
   };
 
-  // Sin número publicable → no es calculable. Se dice, no se inventa.
-  if (
-    cap == null ||
-    window == null ||
-    !quotaLevelHasNumber(level)
-  ) {
+  const isMeasurable =
+    cap != null &&
+    quotaLevelHasNumber(level) &&
+    kind === "WINDOWED" &&
+    (window != null || resetsPerMonth(resetPeriod) != null);
+
+  // Sin número publicable (o sin una forma de medirla) → no es calculable.
+  // Se dice, no se inventa.
+  if (!isMeasurable) {
     return {
       effectiveMessages: Number.POSITIVE_INFINITY,
       quotaHeadroom: 1,
@@ -84,10 +117,10 @@ export function analyzeQuota(
     };
   }
 
-  const messagesPerWindow = (messagesPerDay / 24) * window;
+  const messagesPerWindow = (messagesPerDay / 24) * (window ?? 24);
   const quotaHeadroom = cap > 0 ? Math.min(1, messagesPerWindow / cap) : 0;
   const degraded = quotaHeadroom >= 1;
-  const hoursUntilReset = degraded ? 0 : window * (1 - quotaHeadroom);
+  const hoursUntilReset = degraded ? 0 : (window ?? 24) * (1 - quotaHeadroom);
 
   const labelEs = degraded
     ? `Agotas la cuota (${cap} msgs / ${window}h) — degradación a ${plan.fallbackModelOnLimit ?? "modelo reducido"}`
@@ -112,4 +145,13 @@ export function hasRealLimit(plan: QuotaPlan): boolean {
   if (plan.quotaLevel === "UNLIMITED") return false;
   if (plan.fallbackModelOnLimit) return true;
   return quotaLevelHasNumber(plan.quotaLevel ?? "UNKNOWN");
+}
+
+/**
+ * Etiqueta corta de cómo mide el proveedor la cuota.
+ * Se usa en la ficha, junto al nivel, para que el usuario sepa si está
+ * comparando magnitudes equivalentes.
+ */
+export function quotaKindLabel(kind: QuotaKind): string {
+  return QUOTA_KIND_LABELS[kind];
 }

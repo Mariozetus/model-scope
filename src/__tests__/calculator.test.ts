@@ -13,13 +13,22 @@ import {
   tokensPerSession,
   translateContextWindow,
 } from "@/lib/domain/equivalents";
-import { getWorkProfile } from "@/lib/domain/constants";
+import { getWorkProfile, resetsPerMonth } from "@/lib/domain/constants";
 import type { ApiPricing } from "@/lib/domain/types";
 
+/**
+ * Plan con cuota MEDIBLE: tope por ventana de 5 h con número publicado.
+ *
+ * ADR 024: solo un plan `WINDOWED` con número es convertible a mensajes.
+ * Los planes que el proveedor mide por tiers o multiplicadores no lo son,
+ * aunque declaren un nivel alto.
+ */
 const CLAUDE_PRO: SubscriptionPlanInput = {
   monthlyPrice: 20,
   annualPrice: 200,
   quotaLevel: "MEDIUM",
+  quotaKind: "WINDOWED",
+  quotaResetPeriod: "HOURLY",
   estimatedMessageCap: 45,
   resetWindowHours: 5,
   fallbackModelOnLimit: "Claude Haiku 4.5",
@@ -111,6 +120,123 @@ describe("analyzeQuota", () => {
         estimatedMessageCap: null,
       }),
     ).toBe(false);
+  });
+});
+
+describe("forma de medir la cuota (ADR 024)", () => {
+  it("un plan medido por tiers no es convertible a mensajes", () => {
+    // ChatGPT Plus: el chat de texto es ilimitado y lo que se limita son
+    // las herramientas ("Expanded messages"). No hay número de mensajes.
+    const quota = analyzeQuota(
+      {
+        quotaLevel: "HIGH",
+        quotaKind: "TIERED",
+        quotaResetPeriod: "UNKNOWN",
+        estimatedMessageCap: null,
+        fallbackModelOnLimit: "GPT-6.1 Sol",
+      },
+      100,
+    );
+    expect(quota.isCalculable).toBe(false);
+    expect(quota.kind).toBe("TIERED");
+  });
+
+  it("un plan medido por multiplicador no es convertible a mensajes", () => {
+    // Claude Max: "5x Pro usage". 5 veces más de un saldo que no conocemos
+    // NO son 5 veces más mensajes.
+    const quota = analyzeQuota(
+      {
+        quotaLevel: "VERY_HIGH",
+        quotaKind: "MULTIPLIER",
+        quotaResetPeriod: "UNKNOWN",
+        estimatedMessageCap: null,
+      },
+      100,
+    );
+    expect(quota.isCalculable).toBe(false);
+    expect(quota.kind).toBe("MULTIPLIER");
+  });
+
+  it("un plan con saldo compartido no es convertible a mensajes", () => {
+    // xAI: un único saldo de uso entre Grok y Cursor, con reset semanal.
+    const quota = analyzeQuota(
+      {
+        quotaLevel: "HIGH",
+        quotaKind: "SHARED_POOL",
+        quotaResetPeriod: "WEEKLY",
+        estimatedMessageCap: null,
+      },
+      100,
+    );
+    expect(quota.isCalculable).toBe(false);
+    expect(quota.resetPeriod).toBe("WEEKLY");
+    expect(quota.resetLabel).toContain("semana");
+  });
+
+  it("un plan con número pero sin forma de medirlo tampoco cuenta", () => {
+    // El número solo sirve si además sabemos cómo lo mide el proveedor.
+    const quota = analyzeQuota(
+      {
+        quotaLevel: "HIGH",
+        quotaKind: "TIERED",
+        estimatedMessageCap: 45,
+        resetWindowHours: 5,
+      },
+      100,
+    );
+    expect(quota.isCalculable).toBe(false);
+  });
+
+  it("la capacidad mensual es nula para un plan no medible", () => {
+    const result = calculateSubscriptionVsUsage(
+      { messagesPerDay: 100, profile: "quick-question" },
+      {
+        monthlyPrice: 100,
+        quotaLevel: "VERY_HIGH",
+        quotaKind: "MULTIPLIER",
+        quotaResetPeriod: "UNKNOWN",
+        estimatedMessageCap: null,
+        resetWindowHours: null,
+        fallbackModelOnLimit: "GPT-6.2 Sol",
+      },
+      SONNET_PRICING,
+    );
+    expect(result.subscription.messagesPerMonthCapacity).toBeNull();
+    expect(result.subscription.quotaLimited).toBe(false);
+    // Pero el plan SÍ tiene tope: hay fallback.
+    expect(result.subscription.hasRealLimit).toBe(true);
+    expect(result.subscription.quotaKind).toBe("MULTIPLIER");
+  });
+});
+
+describe("periodicidad del reset", () => {
+  it("un pool semanal da menos reinicios al mes que uno horario", () => {
+    // ADR 024: la periodicidad es lo que convierte "un tope por ventana"
+    // en "mensajes al mes". Con el mismo tope nominal, un plan horario da
+    // ~25x más mensajes que uno semanal.
+    expect(resetsPerMonth("HOURLY")).toBe(720);
+    expect(resetsPerMonth("DAILY")).toBe(30);
+    expect(resetsPerMonth("WEEKLY")).toBeCloseTo(30 / 7, 6);
+    expect(resetsPerMonth("MONTHLY")).toBe(1);
+    expect(resetsPerMonth("UNKNOWN")).toBeNull();
+  });
+
+  it("la capacidad usa la periodicidad cuando no hay ventana en horas", () => {
+    const result = calculateSubscriptionVsUsage(
+      { messagesPerDay: 10, profile: "quick-question" },
+      {
+        monthlyPrice: 20,
+        quotaLevel: "HIGH",
+        quotaKind: "WINDOWED",
+        quotaResetPeriod: "DAILY",
+        estimatedMessageCap: 50,
+        resetWindowHours: null,
+      },
+      SONNET_PRICING,
+    );
+    // 50 msgs × 30 reinicios diarios = 1500 al mes
+    expect(result.subscription.messagesPerMonthCapacity).toBe(1500);
+    expect(result.subscription.quotaResetPeriod).toBe("DAILY");
   });
 });
 
@@ -220,6 +346,8 @@ describe("calculateSubscriptionVsUsage", () => {
       {
         monthlyPrice: 20,
         quotaLevel: "LIMITED",
+        quotaKind: "WINDOWED",
+        quotaResetPeriod: "HOURLY",
         estimatedMessageCap: 10,
         resetWindowHours: 1,
         fallbackModelOnLimit: "Modelo mini",
@@ -236,6 +364,8 @@ describe("calculateSubscriptionVsUsage", () => {
       {
         monthlyPrice: 20,
         quotaLevel: "LIMITED",
+        quotaKind: "WINDOWED",
+        quotaResetPeriod: "HOURLY",
         estimatedMessageCap: 10,
         resetWindowHours: 1,
         fallbackModelOnLimit: "Modelo mini",

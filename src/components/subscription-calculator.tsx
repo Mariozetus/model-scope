@@ -69,6 +69,8 @@ export function SubscriptionCalculator({
         monthlyPrice: subscription.monthlyPrice ?? 0,
         annualPrice: subscription.annualPrice,
         quotaLevel: subscription.quotaLevel,
+        quotaKind: subscription.quotaKind,
+        quotaResetPeriod: subscription.quotaResetPeriod,
         estimatedMessageCap: subscription.estimatedMessageCap,
         resetWindowHours: subscription.resetWindowHours,
         fallbackModelOnLimit: subscription.fallbackModelOnLimit,

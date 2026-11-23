@@ -83,6 +83,53 @@ export const QUOTA_LEVELS: readonly QuotaLevel[] = [
   "UNKNOWN",
 ] as const;
 
+/**
+ * Cómo mide el proveedor la cuota de un plan.
+ *
+ * Verificado contra las páginas oficiales de precios (2026-11-22): ningún
+ * proveedor publica un número de mensajes por ventana. Cada uno mide la cuota
+ * de una forma distinta, y el producto tiene que respetarlo en lugar de
+ * inventar una escala común que no existe.
+ *
+ * | Kind | Qué publica el proveedor | Ejemplo real |
+ * |---|---|---|
+ * | `TIERED` | Niveles de acceso por herramienta/modelo | ChatGPT Plus ("Expanded messages") |
+ * | `MULTIPLIER` | Un múltiplo de un plan base | Claude Max ("5x Pro usage") |
+ * | `SHARED_POOL` | Un saldo de uso común a varios productos | xAI ("pool of AI usage") |
+ * | `WINDOWED` | Un tope por ventana de tiempo | Claude Pro (ventana de 5 h) |
+ * | `UNDISCLOSED` | No publica nada verificable | — |
+ */
+export type QuotaKind =
+  /** Niveles de acceso ("Expanded", "Unlimited", "Limited"). */
+  | "TIERED"
+  /** Multiplicador sobre un plan base ("5x Pro usage"). */
+  | "MULTIPLIER"
+  /** Un saldo de uso compartido entre productos, con reset propio. */
+  | "SHARED_POOL"
+  /** Tope por ventana de tiempo. */
+  | "WINDOWED"
+  /** El proveedor no publica nada verificable. */
+  | "UNDISCLOSED";
+
+/**
+ * Periodicidad del reset de la cuota.
+ *
+ * Importa porque la capacidad mensual depende de cuántas veces se reinicia:
+ * un pool semanal son ~4,3 reinicios al mes; uno de 5 horas, ~105. Con la
+ * misma cuota nominal, un plan semanal da 25× menos mensajes que uno horario.
+ */
+export type QuotaResetPeriod =
+  /** Varias veces al día (ventana de unas horas). */
+  | "HOURLY"
+  /** Una vez al día. */
+  | "DAILY"
+  /** Una vez a la semana. */
+  | "WEEKLY"
+  /** Una vez al mes. */
+  | "MONTHLY"
+  /** El proveedor no publica la periodicidad. */
+  | "UNKNOWN";
+
 export interface ModelLifecycle {
   status: "PREVIEW" | "GA" | "DEPRECATED" | "LEGACY";
   /** Fecha de retirada si está deprecado. */
@@ -277,9 +324,33 @@ export interface AccessChannel {
    */
   quotaLevel?: QuotaLevel;
   /**
+   * Cómo mide el proveedor la cuota (ADR 024).
+   *
+   * Determina qué significa la etiqueta y si la capacidad es calculable:
+   * un plan `MULTIPLIER` ("5x Pro usage") no tiene un número de mensajes,
+   * aunque tenga un nivel alto.
+   */
+  quotaKind?: QuotaKind;
+  /**
+   * Periodicidad del reset de la cuota.
+   *
+   * Es imprescindible para calcular la capacidad mensual: un pool semanal
+   * se reinicia ~4,3 veces al mes; uno de 5 horas, ~105. Sin este dato, la
+   * fórmula de capacidad mensual mezcla timers distintos.
+   */
+  quotaResetPeriod?: QuotaResetPeriod;
+  /**
+   * Texto literal de lo que dice el proveedor sobre sus límites.
+   *
+   * Se muestra en la ficha porque es la única fuente de verdad: la
+   * traducción a lenguaje llano es una interpretación, y el usuario puede
+   * tener una lectura distinta de la nuestra.
+   */
+  quotaDisclosure?: string;
+  /**
    * Nº de mensajes por ventana de reset. Solo es fuente de verdad cuando el
-   * nivel es numérico (LIMITED / MEDIUM / HIGH / VERY_HIGH). null = el
-   * proveedor no publica el número.
+   * nivel es numérico (LIMITED / MEDIUM / HIGH / VERY_HIGH) Y el proveedor
+   * publica el número. null = el proveedor no publica el número.
    */
   estimatedMessageCap?: number | null;
   resetWindowHours?: number | null;
